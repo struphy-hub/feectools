@@ -80,12 +80,36 @@ class MockMPI:
     #     return 1
 
 
+def _mpi_disabled():
+    """True if the user or the host application opted out of MPI.
+
+    Importing mpi4py initializes MPI, which takes close to a second. Serial runs that
+    never use MPI can skip it entirely, in two ways:
+
+    * export ``FEECTOOLS_MPI=0`` before starting Python, or
+    * set ``feectools.use_mpi = False`` before this module is first imported
+      (in-process, so it is not inherited by subprocesses such as ``mpirun``).
+
+    The MockMPI wrapper below is then used, exactly as if mpi4py were not installed.
+    """
+    import os
+
+    import feectools
+
+    if getattr(feectools, 'use_mpi', None) is False:
+        return True
+    return os.environ.get('FEECTOOLS_MPI', '').strip().lower() in ('0', 'false', 'no', 'off')
+
+
 try:
     # Disable MPI when using CuPy due to known segfault issues with OpenMPI + CUDA
     import os
     if os.environ.get('ARRAY_BACKEND') == 'cupy':
         raise ImportError("MPI disabled when using CuPy backend")
-    
+
+    if _mpi_disabled():
+        raise ImportError("MPI disabled (feectools.use_mpi = False or FEECTOOLS_MPI=0)")
+
     from mpi4py import MPI
 
     _comm = MPI.COMM_WORLD
