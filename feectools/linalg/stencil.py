@@ -3,21 +3,27 @@
 # LICENSE file or go to https://github.com/pyccel/psydac/blob/devel/LICENSE #
 # for full license details.                                                 #
 #---------------------------------------------------------------------------#
+
+import math
 import os
 import warnings
 from types import MappingProxyType
 
 import cunumpy as xp
+from cunumpy import PyccelKernel
 from cunumpy.xp import array_backend
 from scipy.sparse import coo_matrix, diags as sp_diags
 
 from feectools.ddm.mpi import mpi as MPI
 from feectools.linalg.basic  import VectorSpace, Vector, LinearOperator
+from feectools.linalg.basic  import ReductionWorkspace
 from feectools.linalg.memory import stencil_matrix_memory
 from feectools.ddm.cart      import find_mpi_type, CartDecomposition, InterfaceCartDecomposition
 from feectools.ddm.utilities import get_data_exchanger
 from feectools.api.settings  import PSYDAC_BACKENDS
 
+from feectools.linalg.kernels.device_matvec       import device_matvec
+from feectools.linalg.kernels.device_matvec       import supports as device_matvec_supports
 from feectools.linalg.kernels.axpy_kernels        import axpy_1d, axpy_2d, axpy_3d
 from feectools.linalg.kernels.inner_kernels       import inner_1d, inner_2d, inner_3d
 from feectools.linalg.kernels.matvec_kernels      import matvec_1d, matvec_2d, matvec_3d
@@ -38,17 +44,32 @@ __all__ = (
 def _to_numpy_int64(val):
     """Convert CuPy or NumPy scalar/array to numpy int64."""
     import numpy as _np
-    if hasattr(val, 'get'):
-        # CuPy array - convert to NumPy first
-        val = val.get()
-    return _np.int64(val)
+    return _np.int64(val.get() if xp.is_gpu(val) else val)
 
 def _to_numpy_array(val):
     """Convert CuPy array to NumPy array, preserving dtype. Return as-is if already NumPy."""
-    if hasattr(val, 'get'):
-        # CuPy array - convert to NumPy
-        return val.get()
-    return val
+    return val.get() if xp.is_gpu(val) else val
+
+def _is_device_array(val):
+    """Whether `val` lives on a device (CuPy) rather than on the host."""
+    return xp.is_gpu(val)
+
+def _mpi_exchange_needed(space):
+    """Whether a ghost/assembly exchange really has to go through MPI.
+
+    A space counts as "parallel" as soon as a communicator is attached, which
+    is also true of a single-rank run. There every neighbour in the Cartesian
+    topology is this process itself, so the exchange is a self-message that
+    the serial slicing paths below reproduce exactly -- and far more cheaply,
+    since MPI has to walk the strided stencil datatype element by element.
+    On a device backend that is catastrophic: one ghost update of a 131^2 x 4
+    stencil vector measured 575 ms through MPI against 0.12 ms through the
+    slicing path.
+    """
+    if not space.parallel:
+        return False
+
+    return not getattr(space.cart, "single_process", False)
 
 #========================================================================# Dictionary used to select correct kernel functions based on dimensionality
 kernels = {
@@ -62,6 +83,24 @@ kernels = {
 }
 
 #========================================================================
+
+def _wrap_kernel_table(table):
+    """Wrap every Pyccel kernel in `table` with PyccelKernel, recursively,
+    so StencilMatrix/StencilVector operations also work with CuPy arrays
+    (Pyccel kernels only understand NumPy arrays, see cunumpy.kernel).
+    """
+    if table is None:
+        return None
+    if isinstance(table, dict):
+        return {k: _wrap_kernel_table(v) for k, v in table.items()}
+    if isinstance(table, tuple):
+        return tuple(_wrap_kernel_table(v) for v in table)
+    return PyccelKernel(table)
+
+
+kernels = _wrap_kernel_table(kernels)
+
+#===============================================================================
 def compute_diag_len(pads, shifts_domain, shifts_codomain, return_padding=False):
     """
     Compute the diagonal length and the padding of the stencil matrix for each direction,
@@ -89,16 +128,18 @@ def compute_diag_len(pads, shifts_domain, shifts_codomain, return_padding=False)
     ep : (int)
         Padding that constitutes the starting index of the non zero elements.
     """
-    n  = ((xp.ceil((pads+1)/shifts_codomain)-1)*shifts_domain).astype('int')
-    ep = -xp.minimum(0, n-pads)
+    # pads/shifts are plain Python ints (per-direction metadata), not device
+    # arrays, so this is computed with builtins rather than the array backend.
+    n  = int((math.ceil((pads+1)/shifts_codomain)-1)*shifts_domain)
+    ep = -min(0, n-pads)
     n  = n + ep + pads + 1
     if return_padding:
-        return n.astype('int'), ep.astype('int')
+        return int(n), int(ep)
     else:
-        return n.astype('int')
+        return int(n)
 
 #========================================================================
-class StencilVectorSpace(VectorSpace):
+class StencilVectorSpace(ReductionWorkspace, VectorSpace):
     """
     Vector space for n-dimensional stencil format. Two different initializations
     are possible:
@@ -189,6 +230,18 @@ class StencilVectorSpace(VectorSpace):
         import numpy as np
         self._inner_consts = tuple(np.int64(p) * np.int64(s) for p, s in zip(self._pads, self._shifts))
 
+        # Index expression selecting the owned (non-ghost) part of the data
+        # array, matching the loop bounds of the kernels above. Written as
+        # `slice(ng, n - ng)` rather than `slice(ng, -ng)` because the latter
+        # selects nothing when a direction has no ghost cells at all.
+        self._inner_index = tuple(slice(int(ng), int(n) - int(ng))
+                                  for ng, n in zip(self._inner_consts, self._shape))
+
+        # Number of owned entries: zero means this rank holds no data, in which
+        # case the compiled kernels must not be called at all.
+        self._inner_size = math.prod(max(0, s.stop - s.start)
+                                     for s in self._inner_index)
+
 
         # TODO [YG, 06.09.2023]: print warning if pure Python functions are used
 
@@ -214,7 +267,7 @@ class StencilVectorSpace(VectorSpace):
         """ The dimension of a vector space V is the cardinality
             (i.e. the number of vectors) of a basis of V over its base field.
         """
-        return xp.prod(self._npts)
+        return math.prod(self._npts)
 
     # ...
     @property
@@ -266,23 +319,118 @@ class StencilVectorSpace(VectorSpace):
 
         """
 
+        if self._reduction_is_trivial(x):
+            return self._inner_local(x, y)
+
+        return self.inner_many((x, y))[0]
+
+    # ...
+    def inner_many(self, *pairs):
+        """
+        Evaluate several inner products of this space in one go, see
+        :meth:`feectools.linalg.basic.VectorSpace.inner_many`.
+
+        All local partial sums are computed first, then reduced across the
+        communicator with a single Allreduce, and finally brought to the host
+        with a single transfer. Compared to calling `inner` once per pair this
+        saves (n - 1) collectives and, on a device backend, (n - 1)
+        device-to-host synchronizations.
+
+        Parameters
+        ----------
+        *pairs : tuple[StencilVector, StencilVector]
+            The (x, y) pairs to evaluate; x is the conjugated one.
+
+        Returns
+        -------
+        tuple[float | complex, ...]
+            One scalar per pair, in the order the pairs were given.
+        """
+        if len(pairs) == 0:
+            return ()
+
+        if self._reduction_is_trivial(pairs[0][0]):
+            return tuple(self._inner_local(x, y) for x, y in pairs)
+
+        send = self._reduction_send(len(pairs))
+        self._inner_local_into(pairs, send)
+        comms = self._reduction_comms()
+        return self._reduce_to_host(send, comms[0] if comms else None,
+                                    self.mpi_type)
+
+    # ...
+    def _reduction_is_trivial(self, x):
+        """
+        Whether a reduction over this space has nothing to do beyond the local
+        sums: the space is serial (no collective) and its data is on the host
+        (no transfer). Then the local values are already the answer and the
+        reduction scratch can be skipped entirely, which is worth doing because
+        on a small space the bookkeeping is visible next to the kernel itself.
+        """
+        return (not self.parallel
+                and self._inner_size != 0
+                and not _is_device_array(x._data))
+
+    # ...
+    def _inner_local(self, x, y):
+        """
+        The process-local (unreduced) inner product of `x` and `y`, left
+        wherever it was computed: a host scalar on the NumPy backend, a device
+        scalar on the CuPy one.
+        """
         assert isinstance(x, StencilVector)
         assert isinstance(y, StencilVector)
         assert x.space is self
         assert y.space is self
 
-        inner_func = self._inner_func
-        inner_args = (x._data, y._data, *self._inner_consts)
+        if self._inner_size == 0:
+            # This rank owns no coefficients; the kernels cannot be called on
+            # an empty array, and the local contribution is zero.
+            return 0
 
-        if self.parallel:
-            # Sometimes in the parallel case, we can get an empty vector that breaks our kernel
-            x._dot_send_data[0] = 0 if x._data.shape[0] == 0 else inner_func(*inner_args)
-            self.cart.global_comm.Allreduce((x._dot_send_data, self.mpi_type),
-                                            (x._dot_recv_data, self.mpi_type),
-                                             op=MPI.SUM )
-            return x._dot_recv_data[0]
-        else:
-            return inner_func(*inner_args)
+        if _is_device_array(x._data):
+            # The compiled kernels are host code, so feeding them device arrays
+            # would copy both operands off the device and run a serial loop on
+            # the CPU. Reduce on the device instead.
+            index = self._inner_index
+            return xp.sum(xp.conj(x._data[index]) * y._data[index],
+                          dtype=self._dtype)
+
+        return self._inner_func(x._data, y._data, *self._inner_consts)
+
+    # ...
+    def _inner_local_into(self, pairs, out, accumulate=False):
+        """
+        Compute the process-local (unreduced) inner product of each pair and
+        write it into `out`, one entry per pair. With `accumulate=True` the
+        values are added to what `out` already holds, which is how a
+        BlockVectorSpace sums the contributions of its blocks into a single
+        buffer before reducing once.
+
+        Parameters
+        ----------
+        pairs : sequence[tuple[StencilVector, StencilVector]]
+            The (x, y) pairs to evaluate; x is the conjugated one.
+
+        out : array
+            Buffer of at least len(pairs) entries, of the dtype of this space.
+
+        accumulate : bool
+            Add to `out` instead of overwriting it.
+        """
+        for i, (x, y) in enumerate(pairs):
+            if accumulate:
+                out[i] += self._inner_local(x, y)
+            else:
+                out[i] = self._inner_local(x, y)
+
+    # ...
+    def _reduction_comms(self):
+        """
+        The distinct communicators a fused reduction over this space has to go
+        through: empty in serial, one entry when distributed.
+        """
+        return (self.cart.global_comm,) if self.parallel else ()
 
     # ...
     def axpy(self, a, x, y):
@@ -315,22 +463,24 @@ class StencilVectorSpace(VectorSpace):
             else:
                 a = float(a)
 
+        if _is_device_array(y._data):
+            # The compiled kernel is host code; on the device this is just a
+            # scaled add over the whole array (ghost regions included), which
+            # is what the kernel does too.
+            y._data += a * x._data
+            for axis, ext in self.interfaces:
+                y._interface_data[axis, ext] += a * x._interface_data[axis, ext]
+            x._sync = x._sync and y._sync
+            return
+
         x_data_np = _to_numpy_array(x._data)
         y_data_np = _to_numpy_array(y._data)
         self._axpy_func(a, x_data_np, y_data_np)
-        # Copy result back if CuPy
-        if hasattr(y._data, 'get'):
-            import cupy as cp
-            y._data[:] = cp.asarray(y_data_np)
 
         for axis, ext in self.interfaces:
             x_int_np = _to_numpy_array(x._interface_data[axis, ext])
             y_int_np = _to_numpy_array(y._interface_data[axis, ext])
             self._axpy_func(a, x_int_np, y_int_np)
-            # Copy result back if CuPy
-            if hasattr(y._interface_data[axis, ext], 'get'):
-                import cupy as cp
-                y._interface_data[axis, ext][:] = cp.asarray(y_int_np)
 
         x._sync = x._sync and y._sync
 
@@ -477,8 +627,11 @@ class StencilVector(Vector):
         self._ndim           = len(V.npts)
         # self._data           = xp.zeros(V.shape, dtype=V.dtype)
         self._data = xp.zeros(tuple(int(s) for s in V.shape), dtype=V.dtype)
-        self._dot_send_data  = xp.zeros((1,), dtype=V.dtype)
-        self._dot_recv_data  = xp.zeros((1,), dtype=V.dtype)
+        # NOTE: the scratch buffers backing the reduction in `inner`/`inner_many`
+        # used to live here, one pair per vector. They now belong to the space
+        # (see ReductionWorkspace), which both avoids duplicating them across
+        # the temporaries a Krylov solver holds and lets several scalars share
+        # a single collective.
         self._interface_data = {}
         self._requests       = None
 
@@ -775,13 +928,15 @@ class StencilVector(Vector):
         """
 
         # Update interior ghost regions
-        if self.space.parallel:
+        if _mpi_exchange_needed(self.space):
             if not self.space.cart.is_comm_null:
                 # PARALLEL CASE: fill in ghost regions with data from neighbors
                 self.space._synchronizer.start_update_ghost_regions(self._data, self._requests)
                 self.space._synchronizer.  end_update_ghost_regions(self._data, self._requests)
         else:
-            # SERIAL CASE: fill in ghost regions along periodic directions, otherwise set to zero
+            # SERIAL CASE: fill in ghost regions along periodic directions, otherwise set to zero.
+            # A single-rank Cartesian space lands here too: see
+            # `_mpi_exchange_needed`.
             self._update_ghost_regions_serial()
 
         # Update interface ghost regions
@@ -1099,6 +1254,23 @@ class StencilMatrix(LinearOperator):
         if not v.ghost_regions_in_sync:
             v.update_ghost_regions()
 
+        if (self._device_matvec_args() is not None
+                and _is_device_array(self._data)
+                and _is_device_array(v._data)
+                and _is_device_array(out._data)):
+            # Data is on the device: run the product there. Going through the
+            # compiled (host) kernel would copy the matrix and the vector off
+            # the device and reduce serially on the CPU.
+            # zeros, not empty: the kernel only writes the interior
+            # (non-padding) region, and the host path leaves the padding zeroed.
+            out._data[...] = 0
+            device_matvec(self._data, v._data, out._data,
+                          **self._device_matvec_args())
+
+            # IMPORTANT: flag that ghost regions are not up-to-date
+            out.ghost_regions_in_sync = False
+            return out
+
         # Convert arrays for compiled kernel - create NumPy output
         import numpy as _np
         self_data_np = _to_numpy_array(self._data)
@@ -1114,9 +1286,9 @@ class StencilMatrix(LinearOperator):
             args_np[key] = _to_numpy_array(val)
 
         self._func(self_data_np, v_data_np, out_data_np, **args_np)
-        
+
         # Copy result back to CuPy array if needed
-        if hasattr(out._data, 'get'):
+        if xp.is_gpu(out._data):
             import cupy as cp
             out._data[:] = cp.asarray(out_data_np)
         else:
@@ -1125,6 +1297,36 @@ class StencilMatrix(LinearOperator):
         # IMPORTANT: flag that ghost regions are not up-to-date
         out.ghost_regions_in_sync = False
         return out
+
+    # ...
+    def _device_matvec_args(self):
+        """
+        The arguments for :func:`device_matvec`, or None if this matrix cannot
+        use it.
+
+        The device kernel mirrors the *precompiled* stencil matvec, which is
+        the one selected by `set_backend(..., precompiled=True)` and is
+        recognised by the parameters it takes. Any other backend (in
+        particular the pure-Python `_dot`, which is parametrised differently)
+        falls back to the host path.
+        """
+        cached = getattr(self, '_device_matvec_args_cache', False)
+        if cached is not False:
+            return cached
+
+        keys = ('s_in', 'p_in', 'add', 's_out', 'e_out', 'p_out')
+        if (not device_matvec_supports(self._ndim, self.dtype)
+                or set(self._args) != set(keys)):
+            args = None
+        else:
+            # For ndim == 1 these are plain ints, otherwise arrays; the device
+            # helper wants a sequence per direction either way.
+            args = {k: (_to_numpy_array(self._args[k]).tolist()
+                        if self._ndim > 1 else [int(self._args[k])])
+                    for k in keys}
+
+        self._device_matvec_args_cache = args
+        return args
 
     # ...
     def vdot( self, v, out=None):
@@ -1175,7 +1377,7 @@ class StencilMatrix(LinearOperator):
         self._func(self_data_np, v_data_conj_np, out_data_np, **args_np)
         
         # Copy result back to CuPy array if needed
-        if hasattr(out._data, 'get'):
+        if xp.is_gpu(out._data):
             import cupy as cp
             out_data_conj = cp.conjugate(cp.asarray(out_data_np))
             out._data[:] = out_data_conj
@@ -1217,14 +1419,30 @@ class StencilMatrix(LinearOperator):
         else :
             out = StencilMatrix(M.codomain, M.domain, pads=self._pads, backend=self._backend, precompiled=self._precompiled)
 
+        if _is_device_array(M._data) and _is_device_array(out._data):
+            from feectools.linalg.kernels.device_transpose import (
+                device_transpose_3d,
+                supports as device_transpose_supports,
+            )
+
+            if device_transpose_supports(M._data, out._data, conjugate):
+                device_transpose_3d(
+                    M._data,
+                    out._data,
+                    **self._transpose_args,
+                )
+                out.ghost_regions_in_sync = False
+                return out
+
         # Call low-level '_transpose' function (works on Numpy arrays directly)
         # Convert CuPy arrays to NumPy for compiled kernels
         M_data_np = _to_numpy_array(M._data)
         out_data_np = _to_numpy_array(out._data)
         
         if conjugate:
-            self._transpose_func(_to_numpy_array(xp.conjugate(M_data_np)), out_data_np, **self._transpose_args)
-            self._transpose_func(xp.conjugate(M._data), out._data, **self._transpose_args)
+            # This kernel is host-backed.  Conjugate the staged host array,
+            # rather than passing it through CuPy's ufunc dispatcher.
+            self._transpose_func(M_data_np.conj(), out_data_np, **self._transpose_args)
         else:
             self._transpose_func(M_data_np, out_data_np, **self._transpose_args)
         
@@ -1473,7 +1691,7 @@ class StencilMatrix(LinearOperator):
         elements (e.g. in matrix transposition).
         """
         ndim     = self._codomain.ndim
-        parallel = self._codomain.parallel
+        parallel = _mpi_exchange_needed(self._codomain)
 
         if parallel:
             if not self._codomain.cart.is_comm_null:
@@ -1481,7 +1699,9 @@ class StencilMatrix(LinearOperator):
                 self._synchronizer.start_update_ghost_regions( self._data, self._requests )
                 self._synchronizer.end_update_ghost_regions( self._data , self._requests)
         else:
-            # SERIAL CASE: fill in ghost regions along periodic directions, otherwise set to zero
+            # SERIAL CASE: fill in ghost regions along periodic directions, otherwise set to zero.
+            # A single-rank Cartesian space lands here too: see
+            # `_mpi_exchange_needed`.
             self._update_ghost_regions_serial()
 
         # Flag ghost regions as up-to-date
@@ -1687,7 +1907,7 @@ class StencilMatrix(LinearOperator):
 
         M = coo_matrix(
                 (data,(rows,cols)),
-                shape = [xp.prod(nr),xp.prod(nc)],
+                shape = [math.prod(nr),math.prod(nc)],
                 dtype = self._domain.dtype
         )
 
@@ -1749,23 +1969,12 @@ class StencilMatrix(LinearOperator):
             data[:ind] = cp.asarray(data_np[:ind])
             rows[:ind] = cp.asarray(rows_np[:ind])
             cols[:ind] = cp.asarray(cols_np[:ind])
-        nrl = [_np.int64(e-s+1) for s,e in zip(self.codomain.starts, self.codomain.ends)]
-        ncl = [_np.int64(i) for i in self._data.shape[nd:]]
-        ss = [_np.int64(i) for i in ss]
-        nr = [_np.int64(i) for i in nr]
-        nc = [_np.int64(i) for i in nc]
-        dm = [_np.int64(i) for i in dm]
-        cm = [_np.int64(i) for i in cm]
-        cpads = [_np.int64(i) for i in cpads]
-        pp = [_np.int64(i) for i in pp]
 
-        stencil2coo = kernels['stencil2coo'][order][nd]
-        ind = stencil2coo(self._data, data, rows, cols, *nrl, *ncl, *ss, *nr, *nc, *dm, *cm, *cpads, *pp)
-        
-        
         if array_backend.backend == "cupy":
+            def _host(a):
+                return xp.to_numpy(a)
             M = coo_matrix(
-                (data[:ind].get(), (rows[:ind].get(), cols[:ind].get())),
+                (_host(data[:ind]), (_host(rows[:ind]), _host(cols[:ind]))),
                 shape=[int(_np.prod(nr)), int(_np.prod(nc))],
                 dtype=self.dtype
             )
@@ -1854,7 +2063,7 @@ class StencilMatrix(LinearOperator):
         # Create Scipy COO matrix
         M = coo_matrix(
                 (data,(rows,cols)),
-                shape = [xp.prod(nr), xp.prod(nc)],
+                shape = [math.prod(nr), math.prod(nc)],
                 dtype = self._domain.dtype
         )
 
@@ -1881,7 +2090,10 @@ class StencilMatrix(LinearOperator):
         for direction in range(self._codomain.ndim):
 
             periodic = self._codomain.periods[direction]
-            p        = self._codomain.pads   [direction]
+            # The ghost region is `shifts` copies of `pads` wide, exactly as
+            # in StencilVector._update_ghost_regions_serial; using `pads`
+            # alone silently mismatched the MPI exchange whenever shifts > 1.
+            p        = self._codomain.pads[direction] * self._codomain.shifts[direction]
 
             if p == 0:
                 continue
@@ -2008,7 +2220,7 @@ class StencilMatrix(LinearOperator):
 
             # matvec kernel
             dot_func_name = 'matvec_' + str(self._ndim) + 'd_kernel'
-            self._func = getattr(stencil_dot_kernels, dot_func_name)
+            self._func = PyccelKernel(getattr(stencil_dot_kernels, dot_func_name))
 
             # parameter for rectangular matrices
             add = [int(end_in >= end_out) for end_in, end_out in zip(self.domain.ends, self.codomain.ends)]
@@ -2032,7 +2244,7 @@ class StencilMatrix(LinearOperator):
             # transpose kernel
             transp_func_name = 'transpose_' + str(self._ndim) + 'd_kernel'
 
-            self._transpose_func = getattr(stencil_transpose_kernels, transp_func_name)
+            self._transpose_func = PyccelKernel(getattr(stencil_transpose_kernels, transp_func_name))
 
             # parameter for rectangular matrices
             add = [int(end_out >= end_in) for end_in, end_out in zip(self.domain.ends, self.codomain.ends)]
@@ -2167,7 +2379,7 @@ class StencilMatrix(LinearOperator):
             nrows = [e - s + 1 for s, e in zip(self.codomain.starts, self.codomain.ends)]
             ndim  = self.domain.ndim
 
-            indices = [xp.zeros(xp.prod(nrows), dtype=int) for _ in range(2 * ndim)]
+            indices = [xp.zeros(math.prod(nrows), dtype=int) for _ in range(2 * ndim)]
 
             for l, xx in enumerate(xp.ndindex(*nrows)):
                 ii = [m * p + x for m, p, x in zip(dm, dp, xx)]
@@ -2239,7 +2451,8 @@ class StencilDiagonalMatrix(LinearOperator):
         return int(self._data.nbytes)
 
     def tosparse(self):
-        return sp_diags(self._data.ravel())
+        # scipy.sparse.diags expects a host sequence of diagonal arrays.
+        return sp_diags([xp.to_numpy(self._data).ravel()], [0])
 
     def toarray(self):
         return self._data.copy()
@@ -2927,7 +3140,7 @@ class StencilInterfaceMatrix(LinearOperator):
 
         M = coo_matrix(
                     (data,(rows,cols)),
-                    shape = [xp.prod(nr),xp.prod(nc)],
+                    shape = [math.prod(nr),math.prod(nc)],
                     dtype = self.domain.dtype)
 
         return M

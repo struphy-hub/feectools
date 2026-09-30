@@ -8,14 +8,15 @@ from types import MappingProxyType
 from scipy.sparse import bmat, lil_matrix
 
 from feectools.linalg.basic    import VectorSpace, Vector, LinearOperator
+from feectools.linalg.basic    import ReductionWorkspace
 from feectools.linalg.stencil  import StencilMatrix
-from feectools.ddm.cart        import InterfaceCartDecomposition
+from feectools.ddm.cart        import InterfaceCartDecomposition, find_mpi_type
 from feectools.ddm.utilities   import get_data_exchanger
 
 __all__ = ('BlockVectorSpace', 'BlockVector', 'BlockLinearOperator')
 
 #===============================================================================
-class BlockVectorSpace(VectorSpace):
+class BlockVectorSpace(ReductionWorkspace, VectorSpace):
     """
     Product Vector Space V of two Vector Spaces (V1,V2) or more.
 
@@ -52,6 +53,9 @@ class BlockVectorSpace(VectorSpace):
             self._dtype  = spaces[0].dtype
         else:
             raise NotImplementedError("The matrices domains don't have the same data type.")
+
+        # MPI datatype used by the fused reduction of `inner_many`
+        self._mpi_dtype = find_mpi_type(self._dtype)
 
         self._connectivity = connectivity or {}
         self._connectivity_readonly = MappingProxyType(self._connectivity)
@@ -122,7 +126,118 @@ class BlockVectorSpace(VectorSpace):
         assert isinstance(y, BlockVector)
         assert x.space is self
         assert y.space is self
-        return sum(Vi.inner(xi, yi) for Vi, xi, yi in zip(self.spaces, x.blocks, y.blocks))
+        return self.inner_many((x, y))[0]
+
+    #...
+    def inner_many(self, *pairs):
+        """
+        Evaluate several inner products of this product space in one go, see
+        :meth:`feectools.linalg.basic.VectorSpace.inner_many`.
+
+        The blocks are summed into the reduction buffer locally, so the whole
+        batch costs one collective for all pairs *and* all blocks, instead of
+        one per (pair, block) combination as repeated `inner` calls would.
+
+        Parameters
+        ----------
+        *pairs : tuple[BlockVector, BlockVector]
+            The (x, y) pairs to evaluate; x is the conjugated one.
+
+        Returns
+        -------
+        tuple[float | complex, ...]
+            One scalar per pair, in the order the pairs were given.
+        """
+        n = len(pairs)
+        if n == 0:
+            return ()
+
+        for x, y in pairs:
+            assert isinstance(x, BlockVector)
+            assert isinstance(y, BlockVector)
+            assert x.space is self
+            assert y.space is self
+
+        comms = self._reduction_comms()
+        if comms is None or not all(hasattr(Vi, '_inner_local_into')
+                                    for Vi in self._spaces):
+            # A sub-space we do not know how to get local partial sums out of,
+            # or blocks that do not all reduce over the same communicator: let
+            # every block reduce for itself. Note this must not go through
+            # `self.inner`, which delegates back here.
+            return tuple(self._inner_unfused(x, y) for x, y in pairs)
+
+        if self._reduction_is_trivial(pairs[0][0]):
+            # Serial and on the host: there is neither a collective nor a
+            # transfer to amortize, so the plain per-block sum is cheaper than
+            # routing everything through the reduction scratch.
+            return tuple(self._inner_unfused(x, y) for x, y in pairs)
+
+        send = self._reduction_send(n)
+        self._inner_local_into(pairs, send)
+        return self._reduce_to_host(send, comms[0] if comms else None,
+                                    self._mpi_dtype)
+
+    #...
+    def _inner_unfused(self, x, y):
+        """Inner product as the sum of the inner products of the blocks, each
+        reduced on its own."""
+        return sum(Vi.inner(xi, yi)
+                   for Vi, xi, yi in zip(self.spaces, x.blocks, y.blocks))
+
+    #...
+    def _reduction_is_trivial(self, x):
+        """
+        Whether a reduction over this space has nothing to do beyond the local
+        sums, i.e. that holds for every block. See
+        :meth:`feectools.linalg.stencil.StencilVectorSpace._reduction_is_trivial`.
+        """
+        for Vj, xj in zip(self._spaces, x.blocks):
+            predicate = getattr(Vj, '_reduction_is_trivial', None)
+            if predicate is None or not predicate(xj):
+                return False
+        return True
+
+    #...
+    def _inner_local_into(self, pairs, out, accumulate=False):
+        """
+        Sum the process-local (unreduced) inner products of each pair over the
+        blocks of this space, writing one entry per pair into `out`. See
+        :meth:`feectools.linalg.stencil.StencilVectorSpace._inner_local_into`.
+        """
+        for j, Vj in enumerate(self._spaces):
+            Vj._inner_local_into(
+                [(x.blocks[j], y.blocks[j]) for x, y in pairs],
+                out,
+                accumulate=accumulate or j > 0,
+            )
+
+    #...
+    def _reduction_comms(self):
+        """
+        The communicators a fused reduction over this space goes through, or
+        None if the blocks cannot share a single collective.
+
+        All blocks must agree exactly: either all are serial, or all reduce
+        over the same communicator. Anything else -- blocks on different
+        communicators, or a mix of serial and distributed blocks, where summing
+        the local contributions first would reduce the serial ones once per
+        rank -- disqualifies the fused path.
+        """
+        agreed = None
+        for Vj in self._spaces:
+            getter = getattr(Vj, '_reduction_comms', None)
+            if getter is None:
+                return None
+            sub = getter()
+            if sub is None:
+                return None
+            if agreed is None:
+                agreed = sub
+            elif len(sub) != len(agreed) or any(a is not b for a, b
+                                                in zip(sub, agreed)):
+                return None
+        return () if agreed is None else agreed
 
     #...
     def axpy(self, a, x, y):

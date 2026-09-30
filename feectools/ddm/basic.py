@@ -34,6 +34,60 @@ class CartDataExchanger(ABC):
     """
 
     #---------------------------------------------------------------------------
+    # Shared implementation
+    #---------------------------------------------------------------------------
+
+    def _local_exchange_assembly_data(self, array):
+        """Do the assembly exchange without MPI, on a single-process cart.
+
+        With one process per direction every neighbour in the Cartesian
+        topology is this process itself, so `start_exchange_assembly_data`
+        degenerates to a self-message followed by a local accumulation. MPI
+        has to walk the strided subarray datatype element by element to
+        deliver that message -- ruinously so for a device buffer -- while the
+        same data movement is two slice operations here.
+
+        This reproduces the MPI path exactly, including two details that the
+        older `_exchange_assembly_data_serial` helpers in
+        `feectools.linalg.stencil` do not:
+
+        * the received block really is written into the opposite ghost region
+          (the wrap), not just accumulated into the interior;
+        * across a non-periodic boundary MPI transfers nothing (both ranks are
+          `MPI.PROC_NULL`) but the accumulation step still runs, on whatever
+          the receiving ghost region already held.
+        """
+        cart    = self._cart
+        ndim    = cart.ndim
+        axis    = self._axis
+        periods = cart.periods
+        disp    = 1
+
+        for direction in range(ndim):
+            if direction == axis:
+                continue
+
+            info      = cart.get_shift_info(direction, disp)
+            buf_shape = info['buf_shape']
+
+            if periods[direction]:
+                # The self-message: send block -> receive block. Copy the
+                # source first; the two blocks are disjoint for any grid
+                # wider than its ghost regions, but not by construction.
+                idx_send = tuple(slice(s, s + b) for s, b in zip(info['send_assembly_starts'], buf_shape))
+                idx_recv = tuple(slice(s, s + b) for s, b in zip(info['recv_assembly_starts'], buf_shape))
+                array[idx_recv] = array[idx_send].copy()
+
+            # ... and the accumulation the MPI path performs afterwards,
+            # which runs whether or not anything was received.
+            pads            = [0] * ndim
+            pads[direction] = cart._pads[direction] * cart._shifts[direction]
+
+            idx_from = tuple(slice(s, s + b) for s, b in zip(info['recv_starts'], buf_shape))
+            idx_to   = tuple(slice(s + p, s + b + p) for s, b, p in zip(info['recv_starts'], buf_shape, pads))
+            array[idx_to] += array[idx_from]
+
+    #---------------------------------------------------------------------------
     # Public interface
     #---------------------------------------------------------------------------
 

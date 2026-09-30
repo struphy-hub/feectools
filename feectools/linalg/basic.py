@@ -12,12 +12,15 @@ from types import LambdaType
 from inspect import signature
 
 import cunumpy as xp
+import numpy as np
 from scipy.sparse import coo_matrix
 
+from feectools.ddm.mpi import mpi as MPI
 from feectools.utilities.utils import is_real
 
 __all__ = (
     'VectorSpace',
+    'ReductionWorkspace',
     'Vector',
     'LinearOperator',
     'ZeroOperator',
@@ -98,6 +101,32 @@ class VectorSpace(ABC):
 
         """
 
+    def inner_many(self, *pairs):
+        """
+        Evaluate several inner products of this space V in one go.
+
+        Semantically identical to ``tuple(self.inner(x, y) for x, y in pairs)``,
+        but subclasses are free to fuse the work: on a distributed space the
+        local partial sums of all pairs are reduced with a *single* collective,
+        and on a device backend all results are brought back to the host with a
+        *single* transfer. Krylov solvers, which need several global scalar
+        products per iteration, should prefer this over repeated `inner` calls.
+
+        This base implementation is the unfused fallback.
+
+        Parameters
+        ----------
+        *pairs : tuple[Vector, Vector]
+            The (x, y) pairs to evaluate. As for `inner`, the first vector of
+            each pair is the conjugated one in the complex case.
+
+        Returns
+        -------
+        tuple[float | complex, ...]
+            One scalar per pair, in the order the pairs were given.
+        """
+        return tuple(self.inner(x, y) for x, y in pairs)
+
     @abstractmethod
     def axpy(self, a, x, y):
         """
@@ -116,6 +145,119 @@ class VectorSpace(ABC):
         y : Vector
             The vector modified by this function (incremented by a * x).
         """
+
+#===============================================================================
+class ReductionWorkspace:
+    """
+    Mixin giving a vector space reusable scratch for a fused multi-scalar
+    reduction: a buffer to accumulate the process-local partial sums in, and,
+    on a device backend, a host mirror to reduce and read them through.
+
+    The scratch lives on the space rather than on the vectors, so a solver
+    holding a handful of temporaries does not pay for one reduction buffer per
+    vector. Buffers are grown on demand and then reused, so no allocation
+    happens in a Krylov iteration once the first one is done.
+    """
+
+    __slots__ = ()
+
+    def _reduction_send(self, n):
+        """
+        Get a contiguous buffer for `n` locally-computed scalars of the dtype
+        of this space, living wherever the vector data lives. It aliases
+        persistent scratch, so callers must consume it before the next call.
+        """
+        buf = getattr(self, '_reduce_send_buf', None)
+        if buf is None or buf.size < n:
+            buf = xp.zeros((max(n, 8),), dtype=self.dtype)
+            self._reduce_send_buf = buf
+        # A prefix slice stays contiguous, which MPI requires of a raw buffer.
+        return buf[:n]
+
+    def _host_reduction_buffers(self, n):
+        """
+        Get a pair of host (NumPy) buffers for `n` scalars, in page-locked
+        memory when available so that the device-to-host copy of the partial
+        sums is as cheap as it can be.
+        """
+        buffers = getattr(self, '_reduce_host_bufs', None)
+        if buffers is None or buffers[0].size < n:
+            buffers = (_pinned_empty(max(n, 8), self.dtype),
+                       _pinned_empty(max(n, 8), self.dtype))
+            self._reduce_host_bufs = buffers
+        return buffers[0][:n], buffers[1][:n]
+
+    def _reduce_to_host(self, send, comm, mpi_type):
+        """
+        Globally sum the local partial sums in `send` and return them on the
+        host, as a tuple of NumPy scalars.
+
+        When `send` is a device buffer it is first copied to the host and the
+        reduction is done there. The solver needs these scalars on the host
+        anyway (to divide by them and to test convergence), so the copy is not
+        extra work -- it just moves the one unavoidable synchronization ahead
+        of the collective. In exchange, MPI reduces a handful of bytes of host
+        memory on its fastest path, no result has to be copied back to the
+        device, and nothing here depends on the MPI build being CUDA-aware.
+
+        Parameters
+        ----------
+        send : array
+            Buffer holding this process' partial sums, one per scalar.
+
+        comm : MPI communicator | None
+            Communicator to reduce over, or None if the space is not
+            distributed (in which case the partial sums are already the
+            answer).
+
+        mpi_type : MPI datatype
+            Datatype matching the dtype of this space.
+
+        Returns
+        -------
+        tuple
+            One NumPy scalar per entry of `send`. NumPy scalars rather than
+            Python ones, so the results keep carrying the dtype of the space;
+            they are independent copies, so they stay valid once the scratch
+            is overwritten by the next reduction.
+        """
+        n = send.size
+
+        if xp.is_gpu(send):  # device buffer: one D2H copy for the batch
+            host_send, host_recv = self._host_reduction_buffers(n)
+            send.get(out=host_send)
+            if comm is None:
+                return tuple(host_send)
+            comm.Allreduce((host_send, mpi_type), (host_recv, mpi_type),
+                           op=MPI.SUM)
+            return tuple(host_recv)
+
+        if comm is None:
+            return tuple(send)
+
+        _, host_recv = self._host_reduction_buffers(n)
+        comm.Allreduce((send, mpi_type), (host_recv, mpi_type), op=MPI.SUM)
+        return tuple(host_recv)
+
+
+#===============================================================================
+def _pinned_empty(n, dtype):
+    """
+    Allocate an uninitialised 1D host array of `n` entries, in page-locked
+    (pinned) memory if CuPy is in use, otherwise ordinary host memory.
+    """
+    try:
+        import cupy as cp
+    except ImportError:
+        return np.empty(n, dtype=dtype)
+
+    dtype = np.dtype(dtype)
+    try:
+        mem = cp.cuda.alloc_pinned_memory(n * dtype.itemsize)
+    except Exception:  # noqa: BLE001 - no pinned memory is not an error
+        return np.empty(n, dtype=dtype)
+    return np.frombuffer(mem, dtype=dtype, count=n)
+
 
 #===============================================================================
 class Vector(ABC):
@@ -146,6 +288,27 @@ class Vector(ABC):
         assert isinstance(v, Vector)
         assert self.space is v.space
         return self.space.inner(self, v)
+
+    def inner_many(self, *vectors):
+        """
+        Evaluate the scalar products of self with several vectors of the same
+        space, fusing them into a single reduction. Shorthand for
+        ``self.space.inner_many(*((self, v) for v in vectors))``.
+
+        Parameters
+        ----------
+        *vectors : Vector
+            Vectors belonging to the same space as self. As in `inner`, self is
+            the conjugated argument in the complex case.
+
+        Returns
+        -------
+        tuple[float | complex, ...]
+            One scalar per vector, in the order the vectors were given.
+        """
+        assert all(isinstance(v, Vector) and self.space is v.space
+                   for v in vectors)
+        return self.space.inner_many(*((self, v) for v in vectors))
 
     def mul_iadd(self, a, v):
         """
