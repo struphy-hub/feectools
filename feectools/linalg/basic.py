@@ -7,6 +7,7 @@ provides the fundamental classes for linear algebra operations.
 
 """
 
+import itertools
 from abc import ABC, abstractmethod
 from types import LambdaType 
 from inspect import signature
@@ -284,9 +285,123 @@ class LinearOperator(ABC):
     def tosparse(self):
         """ Convert to a sparse matrix in any of the formats supported by scipy.sparse."""
 
-    @abstractmethod
-    def toarray(self):
-        """ Convert to Numpy 2D array. """
+    def toarray(self, out=None, is_sparse=False, format='csr'):
+        """
+        Assemble the global matrix of the linear operator column by column.
+
+        Column j is computed as ``self.dot(e_j)``, where e_j is the j-th
+        canonical basis vector of the domain, in the global numbering of
+        ``Vector.toarray()`` (C-ordered within each StencilVector, blocks
+        concatenated). Since only ``dot`` is used, this works for any linear
+        operator, including matrix-free ones, whose domain is a
+        StencilVectorSpace or a (possibly nested) BlockVectorSpace thereof.
+
+        The cost is one call to ``dot`` per global degree of freedom of the
+        domain, hence this default is meant for testing and small problems.
+        Subclasses with an explicit matrix representation should override it.
+
+        In parallel, all ranks call ``dot`` collectively, each rank fills the
+        rows it owns, and every rank receives the full matrix.
+
+        Parameters
+        ----------
+        out : numpy.ndarray, optional
+            Dense array of shape ``self.shape`` into which the result is
+            written in place. Must be None if ``is_sparse`` is True.
+
+        is_sparse : bool
+            If True, return a scipy.sparse matrix, otherwise a dense
+            numpy.ndarray.
+
+        format : str
+            Sparse format, only used if ``is_sparse`` is True: one of 'csr'
+            (default), 'csc', 'bsr', 'lil', 'dok', 'coo' or 'dia'.
+
+        Returns
+        -------
+        numpy.ndarray or scipy.sparse matrix
+            The global matrix of shape ``self.shape``, identical on all ranks.
+        """
+        from feectools.linalg.block import BlockVectorSpace
+        from feectools.linalg.stencil import StencilVectorSpace
+
+        # Flatten the (possibly nested) block structure of the domain
+        def leaves(w):
+            if isinstance(w.space, StencilVectorSpace):
+                return [w]
+            elif isinstance(w.space, BlockVectorSpace):
+                return [lw for b in w.blocks for lw in leaves(b)]
+            else:
+                raise TypeError(f'{type(self).__name__}.toarray() requires a domain made of '
+                                f'StencilVectorSpaces, not {type(w.space).__name__}.')
+
+        e_j = self.domain.zeros()
+        Ae_j = self.codomain.zeros()
+        e_j_leaves = leaves(e_j)
+        offsets = xp.cumsum([0] + [lw.space.dimension for lw in e_j_leaves[:-1]])
+
+        if is_sparse:
+            assert out is None, 'out must be None if is_sparse is True.'
+            assert format in ('csr', 'csc', 'bsr', 'lil', 'dok', 'coo', 'dia'), \
+                f'Unknown sparse format {format!r}.'
+            rows, cols, data = [], [], []
+        elif out is None:
+            out = xp.zeros(self.shape, dtype=self.dtype)
+        else:
+            assert isinstance(out, xp.ndarray)
+            assert out.shape == self.shape, f'out has shape {out.shape}, expected {self.shape}.'
+
+        # Index ranges owned by each rank, for every leaf
+        bounds = [(lw.starts, lw.ends) for lw in e_j_leaves]
+        if e_j_leaves[0].space.parallel:
+            comm = e_j_leaves[0].space.cart.comm
+            rank = comm.Get_rank()
+            all_bounds = comm.allgather(bounds)
+        else:
+            comm = None
+            rank = 0
+            all_bounds = [bounds]
+
+        # All ranks loop over all columns, since dot() is collective;
+        # only the owner of index i sets the entry of e_j to one.
+        for owner, owner_bounds in enumerate(all_bounds):
+            for lw, offset, (starts, ends) in zip(e_j_leaves, offsets, owner_bounds):
+                for i in itertools.product(*(range(s, e + 1) for s, e in zip(starts, ends))):
+                    if rank == owner:
+                        lw[i] = 1
+                    lw.update_ghost_regions()
+                    self.dot(e_j, out=Ae_j)
+                    if rank == owner:
+                        lw[i] = 0
+
+                    # Global vector with nonzeros only in the rows owned by this rank
+                    col_j = Ae_j.toarray()
+                    j = offset + xp.ravel_multi_index(i, lw.space.npts)
+                    if is_sparse:
+                        nz = xp.flatnonzero(col_j)
+                        rows.append(nz)
+                        cols.append(xp.full(nz.size, j))
+                        data.append(col_j[nz])
+                    else:
+                        out[:, j] = col_j
+                # Clear the ghost regions of the last entry set to one
+                lw.update_ghost_regions()
+
+        if not is_sparse:
+            if comm is not None:
+                from feectools.ddm.mpi import mpi as MPI
+                comm.Allreduce(MPI.IN_PLACE, out, op=MPI.SUM)
+            return out
+
+        rows = xp.concatenate(rows) if rows else xp.zeros(0, dtype=int)
+        cols = xp.concatenate(cols) if cols else xp.zeros(0, dtype=int)
+        data = xp.concatenate(data) if data else xp.zeros(0, dtype=self.dtype)
+        if comm is not None:
+            rows = xp.concatenate(comm.allgather(rows))
+            cols = xp.concatenate(comm.allgather(cols))
+            data = xp.concatenate(comm.allgather(data))
+
+        return coo_matrix((data, (rows, cols)), shape=self.shape).asformat(format)
 
     @abstractmethod
     def dot(self, v, out=None):
