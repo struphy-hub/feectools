@@ -281,10 +281,6 @@ class LinearOperator(ABC):
         upon convertion to matrix.
         """
 
-    @abstractmethod
-    def tosparse(self):
-        """ Convert to a sparse matrix in any of the formats supported by scipy.sparse."""
-
     def toarray(self, out=None, is_sparse=False, format='csr'):
         """
         Assemble the global matrix of the linear operator column by column.
@@ -402,6 +398,26 @@ class LinearOperator(ABC):
             data = xp.concatenate(comm.allgather(data))
 
         return coo_matrix((data, (rows, cols)), shape=self.shape).asformat(format)
+
+    def tosparse(self, format='csr'):
+        """
+        Assemble the global matrix of the linear operator as a scipy.sparse matrix.
+
+        Default implementation calling the generic ``LinearOperator.toarray``
+        with ``is_sparse=True``; see there for cost and parallel behavior.
+        Subclasses with an explicit matrix representation should override it.
+
+        Parameters
+        ----------
+        format : str
+            One of 'csr' (default), 'csc', 'bsr', 'lil', 'dok', 'coo' or 'dia'.
+
+        Returns
+        -------
+        scipy.sparse matrix
+            The global matrix of shape ``self.shape``, identical on all ranks.
+        """
+        return LinearOperator.toarray(self, is_sparse=True, format=format)
 
     @abstractmethod
     def dot(self, v, out=None):
@@ -1092,9 +1108,6 @@ class ComposedLinearOperator(LinearOperator):
     def dtype(self):
         return None
 
-    def toarray(self):
-        raise NotImplementedError('toarray() is not defined for ComposedLinearOperators.')
-
     def tosparse(self):
         mats = [M.tosparse() for M in self._multiplicants]
         M = mats[0]
@@ -1198,12 +1211,6 @@ class PowerLinearOperator(LinearOperator):
     def factorial(self):
         """ Returns the power to which the operator is raised. """
         return self._factorial
-
-    def toarray(self):
-        raise NotImplementedError('toarray() is not defined for PowerLinearOperators.')
-
-    def tosparse(self):
-        raise NotImplementedError('tosparse() is not defined for PowerLinearOperators.')
 
     def transpose(self, conjugate=False):
         return PowerLinearOperator(domain=self.codomain, codomain=self.domain, A=self._operator.transpose(conjugate=conjugate), n=self._factorial)
@@ -1321,12 +1328,6 @@ class InverseLinearOperator(LinearOperator):
                 assert value > 0, "maxiter must be positive"
             elif key == 'verbose':
                 assert isinstance(value, bool), "verbose must be a bool"
-
-    def toarray(self):
-        raise NotImplementedError('toarray() is not defined for InverseLinearOperators.')
-
-    def tosparse(self):
-        raise NotImplementedError('tosparse() is not defined for InverseLinearOperators.')
 
     def get_info(self):
         """ Returns the previous convergence information. """
@@ -1481,12 +1482,6 @@ class MatrixFreeLinearOperator(LinearOperator):
                     
         return out
         
-    def toarray(self):
-        raise NotImplementedError('toarray() is not defined for MatrixFreeLinearOperator.')
-
-    def tosparse(self):
-        raise NotImplementedError('tosparse() is not defined for MatrixFreeLinearOperator.')
-    
     def transpose(self, conjugate=False):
         if self._dot_transpose is None:
             raise NotImplementedError('no transpose dot method was given -- cannot create the transpose operator')
