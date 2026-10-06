@@ -10,7 +10,7 @@ import warnings
 from types import MappingProxyType
 
 import cunumpy as xp
-from cunumpy import PyccelKernel
+from cunumpy.kernels import PyccelKernel
 from cunumpy.xp import array_backend
 from scipy.sparse import coo_matrix, diags as sp_diags
 
@@ -63,7 +63,7 @@ kernels = {
 def _wrap_kernel_table(table):
     """Wrap every Pyccel kernel in `table` with PyccelKernel, recursively,
     so StencilMatrix/StencilVector operations also work with CuPy arrays
-    (Pyccel kernels only understand NumPy arrays, see cunumpy.kernel).
+    (Pyccel kernels only understand NumPy arrays, see cunumpy.kernels).
     """
     if table is None:
         return None
