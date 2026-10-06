@@ -14,7 +14,7 @@ from cunumpy.xp import array_backend, to_numpy
 # CUDA context before MPI is initialized, as CUDA-aware MPI requires. Must stay
 # above the feectools.ddm.mpi import, which initializes MPI as a side effect.
 # A no-op on the NumPy backend.
-from cunumpy import bind_local_device
+from cunumpy.cuda import bind_local_device
 
 bind_local_device()
 
