@@ -3,7 +3,7 @@ from functools import reduce
 
 import numpy as np
 import cunumpy as xp
-from cunumpy import synchronize_for_mpi
+from cunumpy.mpi import synchronize_for_mpi
 from scipy.sparse import kron
 from scipy.sparse import coo_matrix
 

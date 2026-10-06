@@ -1,6 +1,6 @@
 # coding: utf-8
 
-from cunumpy import synchronize_for_mpi
+from cunumpy.mpi import synchronize_for_mpi
 from feectools.ddm.mpi import mpi as MPI
 
 from .cart import InterfaceCartDecomposition, find_mpi_type

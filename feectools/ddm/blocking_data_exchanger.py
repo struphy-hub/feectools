@@ -1,7 +1,7 @@
 # coding: utf-8
 
 import cunumpy as xp
-from cunumpy import synchronize_for_mpi
+from cunumpy.mpi import synchronize_for_mpi
 import numpy as np
 from feectools.ddm.mpi import mpi as MPI
 

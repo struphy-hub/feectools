@@ -10,8 +10,8 @@ import warnings
 from types import MappingProxyType
 
 import cunumpy as xp
-from cunumpy import synchronize_for_mpi
 from cunumpy.kernels import PyccelKernel
+from cunumpy.mpi import synchronize_for_mpi
 from cunumpy.xp import array_backend
 from scipy.sparse import coo_matrix, diags as sp_diags
 
