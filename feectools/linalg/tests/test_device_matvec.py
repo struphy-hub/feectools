@@ -4,28 +4,23 @@
 # for full license details.                                                 #
 #---------------------------------------------------------------------------#
 """
-Tests for the device (CUDA) stencil matrix-vector product used by
-`StencilMatrix.dot` when the data lives on a GPU.
+Tests for `StencilMatrix.dot`, which calls the kernel `stencil_dot_<n>d` of the
+active backend: the pyccel kernel on NumPy, its CUDA version on CuPy.
 
 The reference is the same stencil sum expressed with shifted array views. It is
-backend-independent, so on the NumPy backend these tests check the reference
-against the compiled host kernel, and on the CuPy backend they check the device
-kernel against the reference -- which pins the device kernel to the compiled one
-by transitivity.
+backend-independent, so on the NumPy backend these tests check the pyccel kernel
+against the reference, and on the CuPy backend the CUDA kernel. The kernels are
+also compared with each other directly, on a GPU (test_cuda_parity.py) and by
+CPU emulation (test_cuda_emulation.py).
 """
 import itertools
 
 import numpy as np
 import pytest
 import cunumpy as xp
-from cunumpy.xp import array_backend
 
 from feectools.ddm.cart import DomainDecomposition, CartDecomposition
-from feectools.linalg.kernels.device_matvec import supports as device_supports
-from feectools.linalg.stencil import StencilVectorSpace, StencilVector, StencilMatrix
-
-ON_CUPY = array_backend.backend == "cupy"
-
+from feectools.linalg.stencil import StencilVectorSpace, StencilVector, StencilMatrix, stencil_kernels
 
 # ===============================================================================
 def make_space(npts, pads, dtype):
@@ -149,23 +144,6 @@ def test_matvec_matches_reference(name, npts_d, npts_c, pads):
 
 
 # ===============================================================================
-@pytest.mark.parametrize('name, npts_d, npts_c, pads', CASES,
-                         ids=[c[0] for c in CASES])
-def test_matvec_complex(name, npts_d, npts_c, pads):
-    """Complex matvec. The compiled host kernel is typed on float64 and cannot
-    do this at all, so it is only checked where the device kernel runs."""
-    if not (ON_CUPY and device_supports(len(npts_d), complex)):
-        pytest.skip('complex matvec needs the device kernel')
-
-    V, W, A, v = build(npts_d, npts_c, pads, complex)
-
-    got = A.dot(v, out=StencilVector(W))
-    ref = reference_matvec(A, v, StencilVector(W))
-
-    assert xp.allclose(got._data, ref._data, rtol=0.0, atol=1e-12)
-
-
-# ===============================================================================
 def test_matvec_leaves_padding_zeroed():
     """The kernel writes only the owned rows; the padding of `out` must come
     out zeroed, as it does on the host path, even when `out` is reused."""
@@ -199,24 +177,27 @@ def test_matvec_out_and_repeated_calls_agree():
 
 
 # ===============================================================================
-@pytest.mark.skipif(not ON_CUPY, reason='device kernel requires the CuPy backend')
-def test_device_kernel_is_actually_used():
-    """Guard against the device path silently falling back to the host one,
-    which would still be correct but would undo the point of the kernel."""
-    V, W, A, v = build((7, 8, 9), (7, 8, 9), (1, 2, 2), float)
-    assert A._device_matvec_args() is not None
+@pytest.mark.parametrize('ndim', [1, 2, 3])
+def test_dot_calls_the_folder_kernel(ndim):
+    """`StencilMatrix.dot` calls the kernel of the folder `stencil_dot_<n>d`,
+    which has a CUDA version: on CuPy there is no host fallback."""
+    name, npts_d, npts_c, pads = next(c for c in CASES if len(c[1]) == ndim)
+    V, W, A, v = build(npts_d, npts_c, pads, float)
+    assert A._func is stencil_kernels['dot'][ndim]
+    assert A._func.name == f'stencil_dot_{ndim}d' and A._func.has_cuda
 
 
 # ===============================================================================
-def test_unsupported_dtype_falls_back():
-    """A dtype without a device kernel must decline the fast path rather than
-    produce a wrong answer."""
-    from feectools.linalg.kernels.device_matvec import supports
-
-    assert supports(3, np.float64)
-    assert supports(3, np.complex128)
-    assert not supports(3, np.float32)
-    assert not supports(4, np.float64)
+def test_kernels_reject_matrices_with_other_diagonals():
+    """A matrix with fewer diagonals than 2 * p + 1 (pads smaller than those of
+    the space) cannot use the precompiled kernels: they would read past the
+    diagonal axis, so dot and transpose raise instead."""
+    V = make_space((8, 9), (2, 2), float)
+    A = StencilMatrix(V, V, pads=(1, 1))
+    with pytest.raises(NotImplementedError, match='2 \\* p \\+ 1 diagonals'):
+        A.dot(StencilVector(V))
+    with pytest.raises(NotImplementedError, match='2 \\* p \\+ 1 diagonals'):
+        A.transpose()
 
 
 # ===============================================================================
