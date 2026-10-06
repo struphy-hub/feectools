@@ -91,10 +91,80 @@ Each MPI rank uses its own GPU instead of always GPU 0.
   holds whatever the user imports first.
 - `ddm/tests/test_device_binding.py` checks the current device on a GPU (`requires_cupy`).
 
+## CUDA 4 implementation notes (#88)
+
+The stencil operations of solver loops run on the device: `StencilMatrix.dot` (and `vdot`), `StencilMatrix.transpose`,
+`StencilVectorSpace.inner` and `StencilVectorSpace.axpy`. Each calls one kernel per dimension, a
+`cunumpy.kernels.Kernel` declared in its own folder, which runs the pyccel kernel on NumPy and the CUDA kernel on
+CuPy. There are no backend branches and no host staging at these call sites any more, and no generated CUDA source.
+
+| Operation | Kernels (one folder each) | pyccel version moved from |
+| --- | --- | --- |
+| `StencilMatrix.dot`, `vdot` | `stencil_dot_1d`, `_2d`, `_3d` | `linalg/stencil_dot_kernels.py` (`matvec_<n>d_kernel`) |
+| `StencilMatrix.transpose` | `stencil_transpose_1d`, `_2d`, `_3d` | `linalg/stencil_transpose_kernels.py` (`transpose_<n>d_kernel`) |
+| `StencilVectorSpace.inner` | `stencil_inner_1d`, `_2d`, `_3d` | `linalg/kernels/inner_kernels.py` (`inner_<n>d`) |
+| `StencilVectorSpace.axpy` | `stencil_axpy_1d`, `_2d`, `_3d` | `linalg/kernels/axpy_kernels.py` (`axpy_<n>d`) |
+
+- **Variants: one folder per dimension, float64 on the device.** pyccel needs one function per array rank, and a
+  cunumpy `Kernel` holds one CUDA kernel, so each dimension is its own kernel (`stencil_dot_3d`, ...), with the same
+  argument list for all dimensions of an operation. The CUDA kernels are written for `double`: the precompiled
+  pyccel `dot`/`transpose` kernels are float-only too, while complex `inner`/`axpy` work on NumPy and raise a
+  `TypeError` (dtype check of `CudaKernel`) on CuPy. The previous `CudaKernelVariants` over (dimension, dtype)
+  of generated source is gone.
+- **Signature changes.** The inner kernels add their result to an argument `res` (`res[0] += ...`, the caller
+  zeroes it; `inner` passes the MPI send buffer) instead of returning it, because a CUDA kernel cannot return a
+  value; on the GPU each block reduces in shared memory and adds its sum with one `atomicAdd`. The transpose
+  kernels take `e_in` (end of the row range of `mat`) after `s_in`; pyccel does not need it, the 3D CUDA kernel
+  needs it for the shape of `mat`.
+- **6D matrix data.** cunumpy's array views stop at `Array4D`, so the 3D kernels take the six-axis matrix data as
+  raw pointers (C-contiguity checked by `CudaKernel`) and derive their shape from the other arguments: rows from
+  `out` (dot) or from `s/e/p` (transpose), and `2 * p + 1` diagonals. This is exactly what the precompiled pyccel
+  kernels read, and they are wrong for other data too, so `StencilMatrix.set_backend` records whether the matrix
+  has no shifts and `2 * p + 1` diagonals (`_kernel_shapes_ok`), and `dot`, `vdot` and `transpose` raise
+  `NotImplementedError` otherwise, on both backends (no test or call site in the test suite builds such a matrix
+  for these kernels). Array views up to 6D in cunumpy would remove this restriction (see [Open questions](#open-questions)).
+- **Launch sizes** are declared in each folder's `__init__.py` (`n_threads_from`): one thread per entry of `out`,
+  `matT`, `v1` or `x`, the last axis varying fastest; threads outside the owned rows or diagonals return without
+  writing, as the pyccel loops do. The inner kernels use blocks of 256 threads.
+- **NumPy path:** unchanged results and timings (32×32×16 cells, degree 3: `dot` 6.0 ms, `transpose` 8.2 ms,
+  `inner` 0.02 ms, `axpy` 0.013 ms before and after).
+- `psydac-accelerate` compiles every `*_kernels.py`, so the new folders are compiled like the old modules; `.cu`
+  files are shipped as package data.
+
+## Kernel folders
+
+```
+feectools/linalg/kernels/
+├── __init__.py                       # documentation only
+├── stencil_dot_3d/
+│   ├── __init__.py                   # stencil_dot_3d = Kernel.from_folder(__name__, n_threads_from=...)
+│   ├── stencil_dot_3d_kernels.py     # pyccel (compiled by psydac-accelerate)
+│   ├── stencil_dot_3d_cuda.cu        # CUDA (compiled at runtime by CuPy/NVRTC)
+│   └── stencil_dot_3d_test_args.py   # make_args(backend, seed), CASES, RTOL/ATOL for the parity tests
+├── stencil_dot_1d/, stencil_dot_2d/, stencil_transpose_<n>d/, stencil_inner_<n>d/, stencil_axpy_<n>d/
+└── matvec_kernels.py, transpose_kernels.py, ...   # pyccel kernels without CUDA versions
+```
+
+Conventions, as in struphy:
+
+- The folder name, the pyccel function, the `extern "C" __global__` function and the declared `Kernel` have the
+  same name. The pyccel file ends in `_kernels.py` (found by `psydac-accelerate`); the CUDA file is `<name>_cuda.cu`.
+- Every CUDA function has a `/** ... */` comment naming its pyccel counterpart; parameter and index names are the
+  pyccel ones (`mat`, `x`, `out`, `s_in`, ..., `i1_loc`, `d1`).
+- Code imports the kernel (`from feectools.linalg.kernels.stencil_dot_3d import stencil_dot_3d`) and calls it with
+  positional arguments; `StencilMatrix` and `StencilVectorSpace` select them by dimension from `stencil_kernels`.
+- A new folder is picked up by the tests below without any registration (`test_cuda_parity.PACKAGES`).
+
 ## Testing
 
 - Every PR runs the serial tests (`pytest feectools -m "not mpi and not petsc"`) and the MPI tests
   (`mpirun -n 2 pytest feectools -m "mpi and not petsc" --with-mpi`) on the NumPy backend.
+- `linalg/tests/test_cuda_parity.py`: every folder declares its kernel, the pyccel and CUDA signatures match,
+  every CUDA kernel has test arguments, and on a GPU `cunumpy.kernel_testing.check_parity` runs every case of every
+  kernel; `test_solver_loop_has_no_host_transfers` runs `dot` and `axpy` under `assert_no_transfers`.
+- `linalg/tests/test_cuda_emulation.py`: without a GPU, every CUDA kernel is compiled as C++ and run thread by
+  thread (`cunumpy.kernel_testing.emulate_cuda_kernel`) on the same cases and compared with its pyccel kernel.
+  Threads run one after another, so races are not tested; the inner kernels' barriers and shared memory are.
 - GPU tests are skipped without CuPy and a GPU (`cunumpy.kernel_testing.requires_cupy`). Until a GPU runner exists,
   they are run by hand on an H100 before a PR that touches CUDA code is merged, and the PR description says so.
 
@@ -104,3 +174,11 @@ Each MPI rank uses its own GPU instead of always GPU 0.
   `PyccelKernel` (host copies). They run at setup, not in the time loop; they move into kernel folders with CUDA
   versions when a profile shows they matter.
 - **GPU CI.** No GPU runner yet; GPU tests are run by hand.
+- **6D array views in cunumpy.** With `Array5D`/`Array6D` (also needed by struphy's matrix accumulations), the 3D
+  kernels could take the matrix data as views, drop the shape assumptions and the `e_in` argument.
+- **Complex data on the device.** Not needed by struphy so far; would need a second CUDA kernel per folder (or
+  dtype dispatch in `cunumpy.kernels.Kernel`).
+- **`inner` reduction.** One `atomicAdd` per block of 256 threads, then a copy of the 8-byte result to the host in
+  the serial case (in the parallel case it goes into the MPI reduction). To be measured on the H100.
+- **Interface matrices** (`StencilInterfaceMatrix`) and the remaining stencil kernels (`stencil2coo`, ...) still use
+  `PyccelKernel` with host copies.
