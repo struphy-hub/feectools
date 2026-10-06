@@ -28,8 +28,9 @@ feectools runs on either backend with the same code: on the CuPy backend the ste
 passes device buffers, every rank has its own GPU, and the operations in a solver loop (`dot`, `transpose`,
 `inner`, `axpy`) run on the device without host copies.
 
-A developer who adds a GPU version of a feectools kernel only has to write `<name>_cuda.cu` (and
-`<name>_test_args.py`) in the folder of its pyccel kernel; loading, dispatch and the parity tests come from
+A developer who adds a GPU version of a feectools kernel only has to write `<name>_cuda.cu` in the folder of its
+pyccel kernel and add its parity cases to `linalg/tests/cuda_parity_cases.py`; loading, dispatch and the parity tests
+come from
 [cunumpy](https://github.com/struphy-hub/cunumpy), as in struphy.
 
 ## Principles
@@ -39,8 +40,9 @@ A developer who adds a GPU version of a feectools kernel only has to write `<nam
 - **Data lives where the backend says.** Stencil data are `xp` arrays. Host-only metadata (MPI and index
   bookkeeping, Kronecker solver sizes) stays on NumPy.
 - **One folder per kernel** (from CUDA 4 on). A kernel that is called with stencil data in a solver loop lives in
-  `feectools/<package>/kernels/<name>/` with `<name>_kernels.py` (pyccel), `<name>_cuda.cu`, `<name>_test_args.py`
-  and an `__init__.py` that declares `<name> = Kernel.from_folder(__name__)`. Code imports and calls the kernel.
+  `feectools/<package>/kernels/<name>/` with `<name>_kernels.py` (pyccel), `<name>_cuda.cu` and an `__init__.py`
+  that declares `<name> = Kernel.from_folder(__name__)`. Code imports and calls the kernel. Test inputs are not in
+  the folder: the parity cases of every CUDA kernel are in `linalg/tests/cuda_parity_cases.py`.
 - **1:1 correspondence.** The CUDA kernel has the same name and the same arguments, in the same order, as its
   pyccel kernel.
 - **No silent CPU fallback** for folder kernels: on the CuPy backend a folder kernel without CUDA version raises.
@@ -139,8 +141,7 @@ feectools/linalg/kernels/
 ├── stencil_dot_3d/
 │   ├── __init__.py                   # stencil_dot_3d = Kernel.from_folder(__name__, n_threads_from=...)
 │   ├── stencil_dot_3d_kernels.py     # pyccel (compiled by psydac-accelerate)
-│   ├── stencil_dot_3d_cuda.cu        # CUDA (compiled at runtime by CuPy/NVRTC)
-│   └── stencil_dot_3d_test_args.py   # make_args(backend, seed), CASES, RTOL/ATOL for the parity tests
+│   └── stencil_dot_3d_cuda.cu        # CUDA (compiled at runtime by CuPy/NVRTC)
 ├── stencil_dot_1d/, stencil_dot_2d/, stencil_transpose_<n>d/, stencil_inner_<n>d/, stencil_axpy_<n>d/
 └── matvec_kernels.py, transpose_kernels.py, ...   # pyccel kernels without CUDA versions
 ```
@@ -153,15 +154,19 @@ Conventions, as in struphy:
   pyccel ones (`mat`, `x`, `out`, `s_in`, ..., `i1_loc`, `d1`).
 - Code imports the kernel (`from feectools.linalg.kernels.stencil_dot_3d import stencil_dot_3d`) and calls it with
   positional arguments; `StencilMatrix` and `StencilVectorSpace` select them by dimension from `stencil_kernels`.
-- A new folder is picked up by the tests below without any registration (`test_cuda_parity.PACKAGES`).
+- A new folder is picked up by the tests below through `test_cuda_parity.PACKAGES`; a new CUDA kernel also needs
+  its parity cases in `linalg/tests/cuda_parity_cases.py` (`test_cuda_kernels_have_parity_cases` checks it).
 
 ## Testing
 
 - Every PR runs the serial tests (`pytest feectools -m "not mpi and not petsc"`) and the MPI tests
   (`mpirun -n 2 pytest feectools -m "mpi and not petsc" --with-mpi`) on the NumPy backend.
+- `linalg/tests/cuda_parity_cases.py`: `PARITY_CASES[name]` holds the cases of every CUDA kernel, a plain
+  `build(case)` that returns its arguments on the active backend, and the tolerances (the same structure as in
+  struphy's `pic/tests/cuda_parity_cases.py`).
 - `linalg/tests/test_cuda_parity.py`: every folder declares its kernel, the pyccel and CUDA signatures match,
-  every CUDA kernel has test arguments, and on a GPU `cunumpy.kernel_testing.check_parity` runs every case of every
-  kernel; `test_solver_loop_has_no_host_transfers` runs `dot` and `axpy` under `assert_no_transfers`.
+  the CUDA kernels and the parity cases match, and on a GPU `cunumpy.kernel_testing.assert_kernels_agree` runs every
+  case (one test per case); `test_solver_loop_has_no_host_transfers` runs `dot` and `axpy` under `assert_no_transfers`.
 - `linalg/tests/test_cuda_emulation.py`: without a GPU, every CUDA kernel is compiled as C++ and run thread by
   thread (`cunumpy.kernel_testing.emulate_cuda_kernel`) on the same cases and compared with its pyccel kernel.
   Threads run one after another, so races are not tested; the inner kernels' barriers and shared memory are.

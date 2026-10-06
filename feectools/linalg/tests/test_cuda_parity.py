@@ -1,4 +1,4 @@
-"""Parity of every CUDA kernel with its pyccel kernel, from the ``<name>_test_args.py`` modules of the folders.
+"""Parity of every CUDA kernel with its pyccel kernel, on the cases of ``cuda_parity_cases.PARITY_CASES``.
 
 The kernels are the ones the folders declare (``<name> = Kernel.from_folder(...)`` in ``__init__.py``), with
 their launch options, i.e. the objects the code calls.
@@ -8,8 +8,10 @@ import importlib
 import cunumpy as xp
 import numpy as np
 import pytest
-from cunumpy.kernel_testing import check_parity, parity_cases, requires_cupy
+from cunumpy.kernel_testing import assert_kernels_agree, requires_cupy
 from cunumpy.kernels import Kernel, KernelCatalog
+
+from feectools.linalg.tests.cuda_parity_cases import PARITY_CASES
 
 # all kernel packages with one folder per kernel, for tests that go through every kernel
 PACKAGES = ("feectools.linalg.kernels",)
@@ -21,7 +23,27 @@ DECLARED = KernelCatalog(
         for name in catalog
     }
 )
-CUDA_CASES = parity_cases(DECLARED)
+# every kernel with a CUDA version, by name
+CUDA_KERNELS = dict(DECLARED.parity_cases())
+# (kernel name, case index) of every parity case, as pytest parameters
+PARITY_PARAMS = [
+    pytest.param(name, index, id=f"{name}-{index}")
+    for name in PARITY_CASES
+    for index in range(len(PARITY_CASES[name].cases))
+]
+
+
+def check_case(name, index, compare):
+    """Run case `index` of kernel `name` with `compare(kernel, make_args, **settings)` (cunumpy's signature)."""
+    spec = PARITY_CASES[name]
+    case = spec.cases[index]
+    return compare(
+        CUDA_KERNELS[name],
+        lambda backend, seed: spec.build(case),
+        n_threads=spec.n_threads,
+        rtol=spec.rtol,
+        atol=spec.atol,
+    )
 
 
 def test_folders_declare_their_kernels():
@@ -39,11 +61,10 @@ def test_signatures():
     DECLARED.check_signatures()
 
 
-def test_cuda_kernels_have_test_args():
-    """Every kernel with a CUDA version has a <name>_test_args.py with make_args and CASES."""
-    for name, kernel in DECLARED.parity_cases():
-        assert kernel.test_args_module is not None, f"add {name}_test_args.py to the folder of {name}"
-        assert callable(kernel.test_args.make_args) and len(kernel.test_args.CASES) > 0
+def test_cuda_kernels_have_parity_cases():
+    """Every kernel with a CUDA version has parity cases (add them to cuda_parity_cases.PARITY_CASES), and only those."""
+    assert set(PARITY_CASES) == set(CUDA_KERNELS)
+    assert all(len(spec.cases) > 0 for spec in PARITY_CASES.values())
 
 
 def test_stencil_kernels_have_cuda():
@@ -54,10 +75,9 @@ def test_stencil_kernels_have_cuda():
 
 
 @requires_cupy
-@pytest.mark.parametrize("kernel", CUDA_CASES)
-def test_parity(kernel):
-    for seed in range(len(kernel.test_args.CASES)):
-        check_parity(kernel, seed=seed)
+@pytest.mark.parametrize("name, index", PARITY_PARAMS)
+def test_parity(name, index):
+    check_case(name, index, assert_kernels_agree)
 
 
 @requires_cupy

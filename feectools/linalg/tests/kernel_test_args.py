@@ -1,8 +1,8 @@
 """Arguments of the stencil kernels for the parity tests.
 
-Used by the ``<name>_test_args.py`` modules of the kernel folders in ``feectools.linalg.kernels``: each one
-builds the arguments of its kernel with the active backend (``make_args(backend, seed)``), as
-``StencilMatrix`` and ``StencilVectorSpace`` pass them, from random data that is the same on both backends.
+Each builder returns the arguments of its kernel on the active backend, as ``StencilMatrix`` and
+``StencilVectorSpace`` pass them, from random data that is the same on both backends (seeded with the case index).
+The parity cases built from them are in :mod:`feectools.linalg.tests.cuda_parity_cases`.
 """
 import numpy as np
 import cunumpy as xp
