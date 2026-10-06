@@ -10,7 +10,8 @@ import warnings
 from types import MappingProxyType
 
 import cunumpy as xp
-from cunumpy import PyccelKernel, synchronize_for_mpi
+from cunumpy import synchronize_for_mpi
+from cunumpy.kernels import PyccelKernel
 from cunumpy.xp import array_backend
 from scipy.sparse import coo_matrix, diags as sp_diags
 
@@ -63,7 +64,7 @@ kernels = {
 def _wrap_kernel_table(table):
     """Wrap every Pyccel kernel in `table` with PyccelKernel, recursively,
     so StencilMatrix/StencilVector operations also work with CuPy arrays
-    (Pyccel kernels only understand NumPy arrays, see cunumpy.kernel).
+    (Pyccel kernels only understand NumPy arrays, see cunumpy.kernels).
     """
     if table is None:
         return None
@@ -352,7 +353,7 @@ class StencilVectorSpace(VectorSpace):
                 import cupy as cp
                 y._interface_data[axis, ext][:] = cp.asarray(y_int_np)
 
-        x._sync = x._sync and y._sync
+        y._sync = x._sync and y._sync
 
     #--------------------------------------
     # Other properties/methods
