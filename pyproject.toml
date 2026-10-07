@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name            = "feectools"
-version         = "0.3.1"
+version         = "0.4.0"
 description     = "Slimmed-down fork of Psydac (https://github.com/pyccel/psydac) with less functionality and fewer dependencies."
 readme          = "README.md"
 requires-python = ">= 3.10"
@@ -30,9 +30,8 @@ dependencies = [
     'pyyaml >= 5.1',
     'packaging',
     'pyevtk',
-    'cunumpy >= 0.5.0, < 0.6',
-    # MPI under an MPI launcher, a serial stand-in otherwise (replaces feectools.ddm.mpi)
     'maybempi >= 0.1.2',
+    'cunumpy >= 0.6.1',
 
     # Our packages from PyPi
     'pyccel >= 2.1.0',
