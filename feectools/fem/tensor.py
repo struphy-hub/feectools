@@ -5,8 +5,7 @@ We assume here that a tensor space is the product of fem spaces whom basis are
 of compact support
 
 """
-from feectools.ddm.mpi import mpi as MPI
-    
+from maybempi import MPI
 import cunumpy as xp
 import numpy as np
 import itertools

@@ -86,12 +86,12 @@ guarded against).
 
 Each MPI rank uses its own GPU instead of always GPU 0.
 
-- `feectools.ddm.cart` calls `cunumpy.cuda.bind_local_device()` when it is imported: the process uses GPU
+- `feectools` calls `cunumpy.cuda.bind_local_device()` when it is imported (in `cart` until the move to maybempi): the process uses GPU
   `local_rank % device_count`, from the node-local rank the MPI launcher exports (`cunumpy.mpi.local_rank`).
   No-op on the NumPy backend.
-- The CUDA context must exist before MPI is initialized (CUDA-aware MPI requires it). `ddm/__init__.py` imports
-  `cart` first, and `cart` binds the device before it imports `feectools.ddm.mpi` (which starts MPI), so the order
-  holds whatever the user imports first.
+- The CUDA context must exist before MPI is initialized (CUDA-aware MPI requires it). Since feectools uses
+  maybempi, the device is bound in `feectools/__init__.py`, which runs before any feectools module imports
+  `from maybempi import MPI` (which starts MPI), so the order holds whatever the user imports first.
 - `ddm/tests/test_device_binding.py` checks the current device on a GPU (`requires_cupy`).
 
 ## CUDA 4 implementation notes (#88)
@@ -188,3 +188,13 @@ Conventions, as in struphy:
   the serial case (in the parallel case it goes into the MPI reduction). To be measured on the H100.
 - **Interface matrices** (`StencilInterfaceMatrix`) and the remaining stencil kernels (`stencil2coo`, ...) still use
   `PyccelKernel` with host copies.
+
+## MPI through maybempi
+
+`feectools.ddm.mpi` is gone. Every module imports `from maybempi import MPI`: [maybempi](https://github.com/max-models/maybempi)
+returns `mpi4py.MPI` when the process was started by an MPI launcher and a serial stand-in otherwise, without
+importing mpi4py in serial runs. `maybempi.is_serial(MPI)` replaces the `isinstance(MPI, MockMPI)` checks. The
+serial stand-in behaves like MPI on one rank (`bcast` returns the object, `Gather`/`Allreduce` copy), where the old
+`MockMPI`/`MockComm` turned every call into a no-op returning `None`. The override variable is `MAYBEMPI=0`/`1`;
+`FEECTOOLS_MPI`, `STRUPHY_MPI` and `feectools.use_mpi` are no longer read. cunumpy (since 0.6) uses the same package,
+so feectools, cunumpy and struphy make the same serial/MPI decision.

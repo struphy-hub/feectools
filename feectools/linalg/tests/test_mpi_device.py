@@ -23,7 +23,7 @@ import numpy as np
 import pytest
 import cunumpy as xp
 
-from feectools.ddm.mpi import mpi as MPI
+from maybempi import MPI
 from feectools.ddm.cart import DomainDecomposition, CartDecomposition
 from feectools.linalg.stencil import StencilVectorSpace, StencilVector, StencilMatrix
 

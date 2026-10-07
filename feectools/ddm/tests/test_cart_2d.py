@@ -9,7 +9,7 @@ from feectools.ddm.nonblocking_data_exchanger import NonBlockingCartDataExchange
 def run_cart_2d( data_exchanger_type, verbose=False , nprocs=None, reverse_axis=None):
 
     import cunumpy as xp
-    from feectools.ddm.mpi import mpi as MPI  
+    from maybempi import MPI
     from feectools.ddm.cart import DomainDecomposition, CartDecomposition
 
     #---------------------------------------------------------------------------

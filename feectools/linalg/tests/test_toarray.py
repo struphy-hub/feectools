@@ -6,7 +6,7 @@
 import pytest
 import cunumpy as xp
 
-from feectools.ddm.mpi import mpi as MPI
+from maybempi import MPI
 from feectools.ddm.cart import DomainDecomposition, CartDecomposition
 from feectools.linalg.basic import LinearOperator, MatrixFreeLinearOperator, IdentityOperator
 from feectools.linalg.stencil import StencilVectorSpace, StencilMatrix

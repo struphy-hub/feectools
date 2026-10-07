@@ -101,8 +101,7 @@ def MPITest(commsize):
     def test_stuff(comm):
         pass
     """
-    from feectools.ddm.mpi import mpi as MPI
-        
+    from maybempi import MPI
     if not isinstance(commsize, (tuple, list)):
         commsize = (commsize,)
 
@@ -183,7 +182,7 @@ class Tester( object ):
     #---------------------------------------------------------------------------
     @property
     def comm(self):
-        from feectools.ddm.mpi import mpi as MPI
+        from maybempi import MPI
         return MPI.COMM_WORLD
 
     #---------------------------------------------------------------------------

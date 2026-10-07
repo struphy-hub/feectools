@@ -30,6 +30,7 @@ dependencies = [
     'pyyaml >= 5.1',
     'packaging',
     'pyevtk',
+    'maybempi >= 0.1.2',
     'cunumpy >= 0.6.1',
 
     # Our packages from PyPi
