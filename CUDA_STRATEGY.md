@@ -48,7 +48,7 @@ come from
 - **No silent CPU fallback** for folder kernels: on the CuPy backend a folder kernel without CUDA version raises.
   The other pyccel kernels (B-splines, field evaluation, DOF kernels, used at setup) are wrapped in
   `cunumpy.kernels.PyccelKernel` and copy their arrays to the host and back; see [Open questions](#open-questions).
-- **Same cunumpy as struphy.** `cunumpy >= 0.5.0, < 0.6`; names are imported from the submodules
+- **Same cunumpy as struphy.** `cunumpy >= 0.6.1` (the 3D stencil kernels need its 6D array views); names are imported from the submodules
   (`cunumpy.kernels`, `cunumpy.arguments`, `cunumpy.cuda`, `cunumpy.mpi`, `cunumpy.kernel_testing`); cunumpy 0.6 removed
   the old top-level names, and `CudaKernel`/`CudaKernelVariants` are in `cunumpy.kernels` since 0.6.
 - **Small steps.** Every PR keeps the NumPy path working and tested.
@@ -116,16 +116,11 @@ CuPy. There are no backend branches and no host staging at these call sites any 
   of generated source is gone.
 - **Signature changes.** The inner kernels add their result to an argument `res` (`res[0] += ...`, the caller
   zeroes it; `inner` passes the MPI send buffer) instead of returning it, because a CUDA kernel cannot return a
-  value; on the GPU each block reduces in shared memory and adds its sum with one `atomicAdd`. The transpose
-  kernels take `e_in` (end of the row range of `mat`) after `s_in`; pyccel does not need it, the 3D CUDA kernel
-  needs it for the shape of `mat`.
-- **6D matrix data.** cunumpy's array views stop at `Array4D`, so the 3D kernels take the six-axis matrix data as
-  raw pointers (C-contiguity checked by `CudaKernel`) and derive their shape from the other arguments: rows from
-  `out` (dot) or from `s/e/p` (transpose), and `2 * p + 1` diagonals. This is exactly what the precompiled pyccel
-  kernels read, and they are wrong for other data too, so `StencilMatrix.set_backend` records whether the matrix
-  has no shifts and `2 * p + 1` diagonals (`_kernel_shapes_ok`), and `dot`, `vdot` and `transpose` raise
-  `NotImplementedError` otherwise, on both backends (no test or call site in the test suite builds such a matrix
-  for these kernels). Array views up to 6D in cunumpy would remove this restriction (see [Open questions](#open-questions)).
+  value; on the GPU each block reduces in shared memory and adds its sum with one `atomicAdd`. (The transpose
+  kernels had an argument `e_in` for the shape of the 3D matrix data; it is gone, see the 6D views below.)
+- **6D matrix data:** see [6D matrix views](#6d-matrix-views-stencil-6d-views). (In #88 the 3D kernels took the
+  six-axis data as raw pointers and assumed `2 * p + 1` diagonals; `dot`, `vdot` and `transpose` raised for other
+  matrices.)
 - **Launch sizes** are declared in each folder's `__init__.py` (`n_threads_from`): one thread per entry of `out`,
   `matT`, `v1` or `x`, the last axis varying fastest; threads outside the owned rows or diagonals return without
   writing, as the pyccel loops do. The inner kernels use blocks of 256 threads.
@@ -133,6 +128,37 @@ CuPy. There are no backend branches and no host staging at these call sites any 
   `inner` 0.02 ms, `axpy` 0.013 ms before and after).
 - `psydac-accelerate` compiles every `*_kernels.py`, so the new folders are compiled like the old modules; `.cu`
   files are shipped as package data.
+
+## 6D matrix views (`stencil-6d-views`)
+
+With cunumpy 0.6.1 (`Array5D`/`Array6D`, `CArray5D`/`CArray6D` in `cunumpy/array_view.cuh`) the 3D kernels take
+the matrix data as views, like the 1D/2D kernels (`Array2D`/`Array4D`):
+
+- `stencil_dot_3d(Array6D<double> mat, Array3D<double> x, Array3D<double> out, s_in, p_in, add, s_out, e_out,
+  p_out)` and `stencil_transpose_3d(Array6D<double> mat, Array6D<double> matT, s_in, p_in, add, s_out, e_out,
+  p_out)`; the pyccel versions take `float[:, :, :, :, :, :]` with the same arguments in the same order. Strided
+  views (`Array6D`, not `CArray6D`), as in 1D/2D, so a non-contiguous matrix is not refused.
+- **No `e_in`.** The transpose kernels (all dimensions, the argument list is the same for all) lost `e_in`: it was
+  only needed for the row extents of the raw pointer in 3D.
+- **The number of diagonals comes from the data.** All six kernels (1D, 2D, 3D, pyccel and CUDA) read the number
+  of diagonals `n_k` of each direction from the shape of the matrix data instead of assuming `2 * p_in + 1`: the
+  pads of the matrix are `q_k = (n_k - 1) // 2` (at most the pads of the spaces, `StencilMatrix(V, W, pads=...)`),
+  diagonal `d` of row `i` is the column `i - q + d` (in `x` at `i - q + d - s_in + p_in`), and the last owned row
+  uses `n_k - 1 + add[k]` diagonals. With `q = p` this is the old loop, in the same order and with bitwise the same
+  results (checked against the kernels of #88 run as Python); the pyccel kernels are now one loop nest with the
+  number of diagonals picked per row instead of the eight (3D) spelled-out combinations.
+- **`StencilMatrix`.** `dot`, `vdot` and `transpose` no longer raise for matrices with fewer diagonals (blocks
+  between spaces of different degree, derivative-type stencils); `transpose(out=...)` asserts that `out` has the
+  pads of the matrix. The one restriction left is spaces with **shifts > 1**, which still raise
+  `NotImplementedError` (`_check_kernel_shifts`): the stencil kernels have never handled them, and there is no
+  reference to match, since the general psydac kernels (`matvec_<n>d`, `transpose_<n>d`) disagree with `toarray()`
+  and with each other (the transpose is not the adjoint of the product) for shifts > 1, and psydac never tested
+  them ("TODO: verify for s>1").
+- **Tests.** `MATRIX_CASES` (parity and CPU emulation) has matrices with fewer diagonals and non-periodic
+  rectangular blocks between spaces of different size per direction, including pads 0 (one diagonal);
+  `test_device_matvec.py` compares `dot`, `vdot` and `transpose` of such matrices with dense `toarray()`
+  references, and `test_mpi_device.py` checks a matrix with fewer diagonals and the adjoint identity of its
+  transpose against the global field on any number of ranks.
 
 ## Kernel folders
 
@@ -180,8 +206,9 @@ Conventions, as in struphy:
   `PyccelKernel` (host copies). They run at setup, not in the time loop; they move into kernel folders with CUDA
   versions when a profile shows they matter.
 - **GPU CI.** No GPU runner yet; GPU tests are run by hand.
-- **6D array views in cunumpy.** With `Array5D`/`Array6D` (also needed by struphy's matrix accumulations), the 3D
-  kernels could take the matrix data as views, drop the shape assumptions and the `e_in` argument.
+- **Shifts > 1.** `StencilMatrix.dot`/`transpose` raise for spaces with shifts > 1 (see
+  [6D matrix views](#6d-matrix-views-stencil-6d-views)); supporting them needs a verified definition of the data
+  layout first.
 - **Complex data on the device.** Not needed by struphy so far; would need a second CUDA kernel per folder (or
   dtype dispatch in `cunumpy.kernels.Kernel`).
 - **`inner` reduction.** One `atomicAdd` per block of 256 threads, then a copy of the 8-byte result to the host in

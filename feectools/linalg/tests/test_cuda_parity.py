@@ -89,7 +89,7 @@ def test_solver_loop_has_no_host_transfers():
 
     with xp.use_backend("cupy"):
         rng = np.random.default_rng(0)
-        A, V, W = stencil_matrix((12, 10, 8), (12, 10, 8), (2, 2, 3), rng)
+        A, V, W = stencil_matrix((12, 10, 8), (12, 10, 8), (2, 2, 3), None, None, rng)
         x = stencil_vector(V, rng)
         y = A.dot(x)  # warm up: compiles the CUDA kernels
         V.axpy(0.5, y, x)
