@@ -1,8 +1,7 @@
 # coding: utf-8
 
 from cunumpy.mpi import synchronize_for_mpi
-from feectools.ddm.mpi import mpi as MPI
-
+from maybempi import MPI
 from .cart import InterfaceCartDecomposition, find_mpi_type
 
 __all__ = ('InterfaceCartDataExchanger',)

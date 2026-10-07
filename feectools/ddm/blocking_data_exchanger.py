@@ -3,8 +3,7 @@
 import cunumpy as xp
 from cunumpy.mpi import synchronize_for_mpi
 import numpy as np
-from feectools.ddm.mpi import mpi as MPI
-
+from maybempi import MPI
 from .cart import CartDecomposition, find_mpi_type
 from .basic import CartDataExchanger
 

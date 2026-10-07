@@ -231,7 +231,7 @@ def test_stencil_interface_matrix_3d_serial_init(dtype, n1, n2, n3, p1, p2, p3, 
 @pytest.mark.mpi
 def test_stencil_interface_matrix_2d_parallel_dot(n1, n2, p1, p2, expected):
 
-    from feectools.ddm.mpi import mpi as MPI
+    from maybempi import MPI
     from feectools.ddm.cart     import MultiPatchDomainDecomposition, CartDecomposition, create_interfaces_cart
     from feectools.linalg.block import BlockVectorSpace, BlockVector, BlockLinearOperator
 

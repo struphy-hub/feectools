@@ -41,7 +41,7 @@ def get_plus_starts_ends(minus_starts, minus_ends, minus_npts, plus_npts, minus_
 def run_carts_2d():
     import cunumpy as xp
     
-    from feectools.ddm.mpi import mpi as MPI
+    from maybempi import MPI
     from feectools.ddm.cart import MultiPatchDomainDecomposition, CartDecomposition, create_interfaces_cart
     from feectools.ddm.blocking_data_exchanger  import BlockingCartDataExchanger
     from feectools.ddm.interface_data_exchanger import InterfaceCartDataExchanger

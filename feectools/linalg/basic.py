@@ -385,7 +385,7 @@ class LinearOperator(ABC):
 
         if not is_sparse:
             if comm is not None:
-                from feectools.ddm.mpi import mpi as MPI
+                from maybempi import MPI
                 comm.Allreduce(MPI.IN_PLACE, out, op=MPI.SUM)
             return out
 

@@ -19,7 +19,7 @@ import numpy as np
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 from PIL import Image
-from mpi4py import MPI
+from maybempi import MPI
 
 from sympde.topology.domain import Square
 from sympde.topology.space import ScalarFunctionSpace

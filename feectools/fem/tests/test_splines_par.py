@@ -7,8 +7,7 @@ from feectools.fem.splines import SplineSpace
 from feectools.fem.tensor  import TensorFemSpace
 from feectools.fem.vector  import VectorFemSpace
 from feectools.ddm.cart    import DomainDecomposition
-from feectools.ddm.mpi import mpi as MPI
-
+from maybempi import MPI
 import cunumpy as xp
 
 def test_2d_1():

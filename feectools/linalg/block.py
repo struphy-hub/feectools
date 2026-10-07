@@ -1076,7 +1076,7 @@ class BlockLinearOperator(LinearOperator):
         if not self.codomain.parallel:
             return blocks, blocks_T
 
-        from feectools.ddm.mpi import mpi as MPI
+        from maybempi import MPI
         from feectools.linalg.stencil import StencilInterfaceMatrix
 
         if not isinstance(self.codomain, BlockVectorSpace):

@@ -7,7 +7,7 @@ import pytest
 import scipy.fft as scifft
 import cunumpy as xp
 
-from feectools.ddm.mpi import mpi as MPI
+from maybempi import MPI
 from feectools.linalg.fft import *
 from feectools.ddm.cart               import DomainDecomposition, CartDecomposition
 from feectools.linalg.stencil import StencilVector

@@ -6,7 +6,7 @@
 import pytest
 import cunumpy as xp
 
-from feectools.ddm.mpi import mpi as MPI
+from maybempi import MPI
 from feectools.linalg.stencil import StencilVectorSpace, StencilVector, StencilMatrix
 from feectools.linalg.utilities import array_to_psydac, petsc_to_psydac
 from feectools.ddm.cart import DomainDecomposition, CartDecomposition
