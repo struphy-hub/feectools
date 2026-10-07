@@ -86,6 +86,11 @@ class DenseInverse:
         """
         Solves for the right-hand sides ``rhs`` (rows) where they live, with one matrix product.
 
+        The right-hand sides are the rows of ``rhs``, as in `BandedSolver.solve`, so the
+        solutions are the rows of ``rhs @ op(A)^{-T}``; ``M`` stores ``op(A)^{-T}`` (no
+        symmetry is assumed). Multiplying from the right keeps the row-contiguous work
+        arrays of `KroneckerLinearSolver` as they are: one GEMM, no transpose copy.
+
         ``out`` may be ``rhs`` (in-place solve).
         """
         assert rhs.shape[-1] == self._host.shape[0]
