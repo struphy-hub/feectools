@@ -112,9 +112,11 @@ class BlockVectorSpace(VectorSpace):
 
         Returns
         -------
-        float | complex
+        float | complex | cupy.ndarray
             The scalar product of the two vectors. Note that inner(x, x) is
             a non-negative real number which is zero if and only if x = 0.
+            For vectors with device (CuPy) data, a 0-d device array: the
+            result stays on the device.
 
         """
 
@@ -134,7 +136,8 @@ class BlockVectorSpace(VectorSpace):
         Parameters
         ----------
         a : scalar
-            The scaling coefficient needed for the operation.
+            The scaling coefficient needed for the operation (a 0-d device
+            array is accepted, see `StencilVectorSpace.axpy`).
 
         x : BlockVector
             The vector which is not modified by this function.
