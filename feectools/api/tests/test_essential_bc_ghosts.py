@@ -3,7 +3,7 @@ import pytest
 
 from feectools.api.essential_bc import apply_essential_bc_stencil
 from feectools.ddm.cart import DomainDecomposition
-from feectools.ddm.mpi import mpi as MPI
+from maybempi import MPI
 from feectools.fem.splines import SplineSpace
 from feectools.fem.tensor import TensorFemSpace
 

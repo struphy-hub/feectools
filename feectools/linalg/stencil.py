@@ -15,7 +15,7 @@ from cunumpy.mpi import synchronize_for_mpi
 from cunumpy.xp import array_backend
 from scipy.sparse import coo_matrix, diags as sp_diags
 
-from feectools.ddm.mpi import mpi as MPI
+from maybempi import MPI
 from feectools.linalg.basic  import VectorSpace, Vector, LinearOperator
 from feectools.linalg.memory import stencil_matrix_memory
 from feectools.ddm.cart      import find_mpi_type, CartDecomposition, InterfaceCartDecomposition

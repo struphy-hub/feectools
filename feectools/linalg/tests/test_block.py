@@ -5,7 +5,7 @@ import cunumpy as xp
 from scipy.sparse import csr_matrix
 from random import random, seed
 
-from feectools.ddm.mpi import mpi as MPI
+from maybempi import MPI
 from feectools.linalg.direct_solvers import SparseSolver
 from feectools.linalg.stencil        import StencilVectorSpace, StencilVector, StencilMatrix
 from feectools.linalg.block          import BlockVectorSpace, BlockVector

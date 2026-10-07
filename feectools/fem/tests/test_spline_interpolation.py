@@ -5,8 +5,7 @@
 #---------------------------------------------------------------------------#
 import time
 
-from feectools.ddm.mpi import mpi as MPI
-    
+from maybempi import MPI
 import cunumpy as xp
 import pytest
 

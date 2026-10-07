@@ -2,9 +2,7 @@ import numpy as np
 import pytest
 
 from feectools.ddm.cart import DomainDecomposition
-from feectools.ddm.mpi import mpi as MPI
-
-
+from maybempi import MPI
 def _comm(parallel):
     return MPI.COMM_WORLD if parallel else None
 

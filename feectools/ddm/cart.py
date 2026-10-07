@@ -10,16 +10,8 @@ from itertools import product
 
 from cunumpy.xp import array_backend, to_numpy
 
-# Bind this rank to its own GPU (by its rank within the node) and create the
-# CUDA context before MPI is initialized, as CUDA-aware MPI requires. Must stay
-# above the feectools.ddm.mpi import, which initializes MPI as a side effect.
-# A no-op on the NumPy backend.
-from cunumpy.cuda import bind_local_device
-
-bind_local_device()
-
-from feectools.ddm.mpi import mpi as MPI
-from feectools.ddm.mpi import MockMPI
+# The GPU of this rank is bound in feectools/__init__.py, before MPI starts.
+from maybempi import MPI, is_serial
 from feectools.ddm.partition import compute_dims, partition_procs_per_patch
 
 
@@ -46,7 +38,7 @@ def find_mpi_type( dtype ):
         MPI datatype to be used for communication.
 
     """
-    if not isinstance(MPI, MockMPI):
+    if not is_serial(MPI):
         if isinstance( dtype, MPI.Datatype ):
             mpi_type = dtype
         else:
@@ -92,7 +84,7 @@ class MultiPatchDomainDecomposition:
     def __init__(self, ncells, periods, comm=None, num_threads=None):
 
         assert len( ncells ) == len( periods )
-        if not isinstance(MPI, MockMPI) and comm is not None:
+        if not is_serial(MPI) and comm is not None:
             assert isinstance( comm, MPI.Comm )
         num_threads = num_threads if num_threads else int(os.environ.get('OMP_NUM_THREADS', 1))
 
@@ -236,7 +228,7 @@ class DomainDecomposition:
         assert len( ncells ) == len( periods )
         assert all( n >=1 for n in ncells )
         assert all( isinstance( period, bool ) for period in periods )
-        if isinstance(MPI, MockMPI): 
+        if is_serial(MPI):
             comm = None
         else:
             if comm is not None:
