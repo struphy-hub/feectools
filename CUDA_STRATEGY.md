@@ -49,7 +49,8 @@ come from
   The other pyccel kernels (B-splines, field evaluation, DOF kernels, used at setup) are wrapped in
   `cunumpy.kernels.PyccelKernel` and copy their arrays to the host and back; see [Open questions](#open-questions).
 - **Same cunumpy as struphy.** `cunumpy >= 0.5.0, < 0.6`; names are imported from the submodules
-  (`cunumpy.kernels`, `cunumpy.cuda`, `cunumpy.mpi`, `cunumpy.kernel_testing`), not from the deprecated top level.
+  (`cunumpy.kernels`, `cunumpy.arguments`, `cunumpy.cuda`, `cunumpy.mpi`, `cunumpy.kernel_testing`); cunumpy 0.6 removed
+  the old top-level names, and `CudaKernel`/`CudaKernelVariants` are in `cunumpy.kernels` since 0.6.
 - **Small steps.** Every PR keeps the NumPy path working and tested.
 
 ## CUDA 1 implementation notes (#90, from #85)

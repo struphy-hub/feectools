@@ -1649,7 +1649,7 @@ class LSMR(InverseLinearOperator):
 
             test1 = normr / normb
             if (normA * normr) != 0:test2 = normar / (normA * normr)
-            else:test2 = xp.infty
+            else:test2 = xp.inf
             test3 = 1 / condA
             t1    = test1 / (1 + normA * normx / normb)
             rtol  = btol + atol * normA * normx / normb
