@@ -562,8 +562,8 @@ class CartDecomposition():
         self._domain_decomposition = domain_decomposition
         self._npts          = tuple( npts    )
         # Convert to NumPy arrays for MPI compatibility (MPI can't handle CuPy arrays)
-        self._global_starts = tuple( [ cunumpy.to_numpy(gs) for gs in global_starts]  )
-        self._global_ends   = tuple( [ cunumpy.to_numpy(ge) for ge in global_ends]    )
+        self._global_starts = tuple( [ to_numpy(gs) for gs in global_starts]  )
+        self._global_ends   = tuple( [ to_numpy(ge) for ge in global_ends]    )
         self._pads          = tuple( pads    )
         self._shifts        = tuple( shifts  )
         self._periods       = domain_decomposition.periods
