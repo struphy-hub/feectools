@@ -246,6 +246,43 @@ def test_inner_matches_global_reference():
 
 
 # ===============================================================================
+def test_fewer_diagonals_dot_and_transpose_match_global_reference():
+    """A matrix with fewer diagonals than its spaces' pads allow (pads (1, 1)
+    on a space with pads (1, 2)), which the stencil kernels used to reject:
+    `dot` equals the stencil applied to the global field, and the transpose of
+    a non-symmetric stencil is its adjoint, (A^T u, v) = (u, A v), checked
+    through global inner products so the check is decomposition-free."""
+    comm = MPI.COMM_WORLD
+    V = make_space(NPTS, PADS, comm=comm)
+    glob = global_field(NPTS)
+    v = scatter(V, glob)
+
+    A = StencilMatrix(V, V, pads=(1, 1))
+    A[:, :, 0, 0] = 4.5
+    for axis in range(2):
+        for shift in (-1, 1):
+            key = [slice(None)] * 2 + [0, 0]
+            key[2 + axis] = shift
+            A[tuple(key)] = -1.0
+    A.remove_spurious_entries()
+    assert A._data.shape[2:] == (3, 3)
+
+    w = A.dot(v)
+    ref = reference_apply(glob)
+    expected = float((ref * glob).sum())
+    assert abs(float(w.inner(v)) - expected) <= 1e-9 * abs(expected)
+
+    # non-symmetric: one-sided (derivative-type) entries
+    A[:, :, 1, 0] = -2.0
+    A[:, :, 0, -1] = 0.5
+    A[:, :, 1, 1] = 0.25
+    u = scatter(V, np.flipud(glob).copy())
+    lhs = float(A.transpose().dot(u).inner(v))
+    rhs = float(u.inner(A.dot(v)))
+    assert abs(lhs - rhs) <= 1e-12 * abs(rhs)
+
+
+# ===============================================================================
 def test_inner_result_is_a_copy_of_the_reduction_buffer():
     """The result of the MPI reduction survives the next inner product with the same vector.
 
