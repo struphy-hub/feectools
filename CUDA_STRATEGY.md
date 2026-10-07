@@ -61,7 +61,8 @@ feectools works when cunumpy's backend is CuPy, without device kernels:
   `cunumpy.kernels.PyccelKernel`, so they accept CuPy arrays (copied to the host and back).
 - Host-only metadata stays on NumPy: MPI and index bookkeeping in `ddm` and `fem.partitioning`, Kronecker solver
   sizes, index arithmetic with Python ints.
-- Host-only libraries (LAPACK/SuperLU, SciPy FFT, SciPy sparse) get host copies per array, not by global backend.
+- Host-only libraries (LAPACK/SuperLU, SciPy FFT, SciPy sparse) get host copies per array, not by global backend
+  (the Kronecker solver no longer does, see [Kronecker solver on the device](#kronecker-solver-on-the-device-device-kronecker-solve)).
 - The 1D collocation matrices of the global projectors are built vectorized (element-wise indexing was one device
   round trip per entry: 334 s of a 348 s Derham setup on the GPU).
 - Bug fix on both backends: `StencilMatrix._update_ghost_regions_serial` uses a ghost region `pads * shifts` wide.
@@ -134,6 +135,39 @@ CuPy. There are no backend branches and no host staging at these call sites any 
 - `psydac-accelerate` compiles every `*_kernels.py`, so the new folders are compiled like the old modules; `.cu`
   files are shipped as package data.
 
+## Kronecker solver on the device (device-kronecker-solve)
+
+`KroneckerLinearSolver` solves device data on the device. Before, its 1D solvers (`BandedSolver`, LAPACK
+`?gbtrs`; `SparseSolver`, SuperLU) copied the data of every direction to the host and back in every solve, i.e. in
+every CG iteration preconditioned by struphy's `MassMatrixPreconditioner` (struphy-hub/struphy#650, #689).
+
+- **Dense inverses of the 1D matrices.** `direct_solvers.DenseInverse` inverts a 1D matrix once on the host, with
+  the solver itself (`M = solver.solve(I)`, so pivoting, transposition and the solver's own quirks are those of
+  the host path), and applies it as `rhs @ M`: one GEMM (cuBLAS) over all right-hand sides of a pass. The 1D
+  matrices are small (n ~ tens to hundreds), clamped (banded) or periodic (with corners, so banded storage has
+  full bandwidth anyway), and an n x n GEMM over m right-hand sides is a better fit for a GPU than m banded
+  triangular solves. `cupyx.scipy.linalg` offers dense `lu_factor`/`lu_solve` but, to our knowledge, no
+  `solve_banded`; `lu_solve` would need the dense matrix too and run two triangular solves instead of one GEMM.
+- **Any linear 1D solver.** The Kronecker passes build the inverse from `solver.solve` on host arrays, so
+  struphy's `FFTSolver` (circulant mass matrices, `scipy.linalg.solve_circulant`) works without changes. A 1D
+  solver that must not be replaced by its dense matrix sets `dense_on_device = False`: the FFT "solvers" of
+  `linalg/fft.py` do (an FFT is O(n log n)); they still stage through the host.
+- **Decided by the array**, as before: `KroneckerSolverSerialPass.solve_pass` (also used inside the distributed
+  pass, between the two `Alltoallv`) and `BandedSolver`/`SparseSolver.solve` use the dense inverse for
+  `xp.is_gpu(array)` and LAPACK/SuperLU otherwise. The host path is unchanged.
+- **Copied to the device once, at setup.** A `KroneckerLinearSolver` whose temporaries are on the device (CuPy
+  backend) builds the inverses and copies them to the device in its constructor (and in `transpose()`, which
+  builds a new solver), so `solve` makes no transfer. A standalone `BandedSolver`/`SparseSolver` called with
+  device arrays copies its inverse on the first device solve (one `to_device`), cached per dtype.
+- **Accuracy.** Inverse-times-vector and LU solve are both backward stable; for the well-conditioned mass
+  matrices the results agree to round-off (tests use 1e-12 relative to the solution).
+- **Tests** (`linalg/tests/test_kron_device_solve.py`): `DenseInverse` against the host solvers (banded and
+  sparse, clamped and periodic, transposed, real and complex) and the Kronecker solve against a global
+  reference, serial and with MPI, on the CPU; the device path with cunumpy's fake CuPy in a serial subprocess
+  (clean environment, `MAYBEMPI=0`), including `assert_no_transfers` around `solve`; on a GPU (`requires_cupy`)
+  device against host solves under `assert_no_transfers`, serial and with MPI. Before this change a 3D solve on
+  the fake CuPy made 3 `to_host` copies (one per direction) and 3 uncounted copies back.
+
 ## Kernel folders
 
 ```
@@ -188,6 +222,10 @@ Conventions, as in struphy:
   the serial case (in the parallel case it goes into the MPI reduction). To be measured on the H100.
 - **Interface matrices** (`StencilInterfaceMatrix`) and the remaining stencil kernels (`stencil2coo`, ...) still use
   `PyccelKernel` with host copies.
+- **FFT on the device.** `DistributedFFT` and friends still stage their data through the host (SciPy FFT); they
+  could use `cupyx.scipy.fft` for device data.
+- **Large 1D matrices.** The dense inverse costs n^2 memory and O(m n^2) per pass. Fine for the mass matrices of
+  struphy's preconditioners; for 1D sizes in the thousands a batched banded solve on the device would be cheaper.
 
 ## MPI through maybempi
 

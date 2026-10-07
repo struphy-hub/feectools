@@ -4,13 +4,14 @@
 # for full license details.                                                 #
 #---------------------------------------------------------------------------#
 from abc                 import abstractmethod
+import numpy as np
 import cunumpy as xp
 from cunumpy.xp import array_backend
 from scipy.sparse        import spmatrix, dia_matrix
 
 from feectools.linalg.basic    import LinearSolver
 
-__all__ = ('to_bnd', 'BandedSolver', 'SparseSolver')
+__all__ = ('to_bnd', 'DenseInverse', 'BandedSolver', 'SparseSolver')
 
 #===============================================================================
 def to_bnd(A):
@@ -27,6 +28,84 @@ def to_bnd(A):
         A_bnd[la+ua+i-j, j] = cmat[i,j]
 
     return A_bnd, la, ua
+
+#===============================================================================
+class DenseInverse:
+    """
+    The inverse of a 1D solver's matrix as a dense matrix, for solves on the device.
+
+    LAPACK and SuperLU run on the host only. For device data the matrix is inverted
+    once on the host, by the solver itself (it solves for the identity), and the inverse
+    is applied with one matrix product per solve (a cuBLAS GEMM on CuPy). A device solve
+    then makes no host/device copy. The 1D matrices of Kronecker solvers are small
+    (n ~ tens to hundreds), so the n x n inverse is cheap to store, and one GEMM over all
+    right-hand sides is faster on a GPU than banded triangular solves.
+
+    Right-hand sides are rows, as in `BandedSolver.solve`: for ``rhs`` of shape
+    ``(m, n)`` the solution is ``rhs @ M`` with ``M = solver.solve(I)``, whose row k is
+    the solution for the k-th unit vector, i.e. ``M = op(A)^{-T}``. This holds for any
+    linear 1D solver with the row convention, transposed or not.
+
+    Parameters
+    ----------
+    solver : LinearSolver
+        A 1D solver whose ``solve`` accepts host (NumPy) arrays of shape ``(m, n)``.
+
+    n : int
+        The size of the 1D matrix.
+
+    dtype : dtype
+        The dtype of the right-hand sides.
+    """
+    def __init__(self, solver, n, dtype):
+        eye = np.eye(int(n), dtype=dtype)
+        # host bookkeeping at setup: the host solver applied to the identity
+        self._host = np.ascontiguousarray(xp.to_numpy(solver.solve(eye)))
+        self._device = None
+
+    @property
+    def shape(self):
+        return self._host.shape
+
+    @property
+    def host_matrix(self):
+        """``M`` on the host."""
+        return self._host
+
+    def device_matrix(self):
+        """``M`` on the device, copied there once (on the first call)."""
+        if self._device is None:
+            self._device = xp.to_cupy(self._host)
+        return self._device
+
+    def matrix_for(self, array):
+        """``M`` on the device for a device array, on the host otherwise."""
+        return self.device_matrix() if xp.is_gpu(array) else self._host
+
+    def solve(self, rhs, out=None):
+        """
+        Solves for the right-hand sides ``rhs`` (rows) where they live, with one matrix product.
+
+        ``out`` may be ``rhs`` (in-place solve).
+        """
+        assert rhs.shape[-1] == self._host.shape[0]
+        result = rhs @ self.matrix_for(rhs)
+        if out is None:
+            return result
+        assert out.shape == rhs.shape
+        out[...] = result
+        return out
+
+#===============================================================================
+def _device_inverse(solver, n, dtype):
+    """The `DenseInverse` of a 1D solver for device solves, built on first use and cached per dtype."""
+    cache = getattr(solver, '_dense_inverses', None)
+    if cache is None:
+        cache = solver._dense_inverses = {}
+    key = np.dtype(dtype)
+    if key not in cache:
+        cache[key] = DenseInverse(solver, n, key)
+    return cache[key]
 
 #===============================================================================
 class BandedSolver(LinearSolver):
@@ -117,6 +196,7 @@ class BandedSolver(LinearSolver):
         obj._space = self._space
         obj._dtype = self._dtype
         obj._transposed = not self._transposed
+        obj._dense_inverses = {}
 
         return obj
 
@@ -140,11 +220,19 @@ class BandedSolver(LinearSolver):
 
         transposed = self._transposed
 
+        # LAPACK is host-only: device data is solved with the dense inverse on the
+        # device (see DenseInverse). Decided by the array itself, not the global
+        # backend, since host arrays may be passed on the CuPy backend too.
+        if xp.is_gpu(rhs):
+            if out is not None:
+                assert out.shape == rhs.shape
+                assert out.dtype == rhs.dtype
+            return _device_inverse(self, self._bmat.shape[1], rhs.dtype).solve(rhs, out=out)
+
         if out is None:
-            # LAPACK is host-only: solve on the host, return on the caller's backend.
-            preout, self._sinfo = self._solver_function(self._bmat, self._l, self._u, xp.to_numpy(rhs).T,
+            preout, self._sinfo = self._solver_function(self._bmat, self._l, self._u, rhs.T,
                                                         self._ipiv, trans=transposed)
-            out = xp.asarray(preout.T) if xp.is_gpu(rhs) else preout.T
+            out = preout.T
 
         else:
             assert out.shape == rhs.shape
@@ -157,16 +245,7 @@ class BandedSolver(LinearSolver):
             # TODO: handle non-contiguous views?
 
             # we want FORTRAN-contiguous data (default is assumed to be C contiguous).
-            # LAPACK is host-only: a device array is solved in a host copy. Decided by
-            # the array itself, not the global backend, since host arrays may be passed
-            # on the CuPy backend too.
-            if xp.is_gpu(out):
-                out_cpu = xp.to_numpy(out)
-                _, self._sinfo = self._solver_function(self._bmat, self._l, self._u, out_cpu.T, self._ipiv, overwrite_b=True,
-                                                   trans=transposed)
-                out[...] = xp.asarray(out_cpu)
-            else:
-                _, self._sinfo = self._solver_function(self._bmat, self._l, self._u, out.T, self._ipiv, overwrite_b=True,
+            _, self._sinfo = self._solver_function(self._bmat, self._l, self._u, out.T, self._ipiv, overwrite_b=True,
                                                    trans=transposed)
 
         return out
@@ -206,6 +285,7 @@ class SparseSolver (LinearSolver):
         obj._space = self._space
         obj._splu = self._splu
         obj._transposed = not self._transposed
+        obj._dense_inverses = {}
 
         return obj
 
@@ -229,19 +309,22 @@ class SparseSolver (LinearSolver):
         assert rhs.T.shape[0] == self._splu.shape[1]
         transposed = self._transposed
 
+        # SuperLU is host-only: device data is solved with the dense inverse on the
+        # device (see DenseInverse); decided by the array, not the global backend.
+        if xp.is_gpu(rhs):
+            if out is not None:
+                assert out.shape == rhs.shape
+                assert out.dtype == rhs.dtype
+            return _device_inverse(self, self._splu.shape[1], rhs.dtype).solve(rhs, out=out)
+
         if out is None:
-            # SuperLU is host-only: solve on the host, return on the caller's backend.
-            out = self._splu.solve(xp.to_numpy(rhs).T, trans='T' if transposed else 'N').T
-            if xp.is_gpu(rhs):
-                out = xp.asarray(out)
+            out = self._splu.solve(rhs.T, trans='T' if transposed else 'N').T
 
         else:
             assert out.shape == rhs.shape
             assert out.dtype == rhs.dtype
 
-            # currently no in-place solve exposed. SuperLU is host-only; decided by
-            # the arrays themselves, not the global backend.
-            result = self._splu.solve(xp.to_numpy(rhs).T, trans='T' if transposed else 'N').T
-            out[:] = xp.asarray(result) if xp.is_gpu(out) else result
+            # currently no in-place solve exposed.
+            out[:] = self._splu.solve(rhs.T, trans='T' if transposed else 'N').T
 
         return out
