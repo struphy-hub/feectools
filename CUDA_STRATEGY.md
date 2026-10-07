@@ -62,7 +62,7 @@ feectools works when cunumpy's backend is CuPy, without device kernels:
 - Host-only metadata stays on NumPy: MPI and index bookkeeping in `ddm` and `fem.partitioning`, Kronecker solver
   sizes, index arithmetic with Python ints.
 - Host-only libraries (LAPACK/SuperLU, SciPy FFT, SciPy sparse) get host copies per array, not by global backend
-  (the Kronecker solver no longer does, see [Kronecker solver on the device](#kronecker-solver-on-the-device-device-kronecker-solve)).
+  (the Kronecker solver no longer does, see [Kronecker solver on the device](#kronecker-solver-on-the-device-96)).
 - The 1D collocation matrices of the global projectors are built vectorized (element-wise indexing was one device
   round trip per entry: 334 s of a 348 s Derham setup on the GPU).
 - Bug fix on both backends: `StencilMatrix._update_ghost_regions_serial` uses a ghost region `pads * shifts` wide.
@@ -135,9 +135,9 @@ CuPy. There are no backend branches and no host staging at these call sites any 
 - `psydac-accelerate` compiles every `*_kernels.py`, so the new folders are compiled like the old modules; `.cu`
   files are shipped as package data.
 
-## Kronecker solver on the device (device-kronecker-solve)
+## Kronecker solver on the device (#96)
 
-`KroneckerLinearSolver` solves device data on the device. Before, its 1D solvers (`BandedSolver`, LAPACK
+[#96](https://github.com/struphy-hub/feectools/pull/96): `KroneckerLinearSolver` solves device data on the device. Before, its 1D solvers (`BandedSolver`, LAPACK
 `?gbtrs`; `SparseSolver`, SuperLU) copied the data of every direction to the host and back in every solve, i.e. in
 every CG iteration preconditioned by struphy's `MassMatrixPreconditioner` (struphy-hub/struphy#650, #689).
 
