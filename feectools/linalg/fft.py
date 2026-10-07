@@ -36,6 +36,9 @@ class DistributedFFTBase(LinearOperator):
         function : Callable
             The given function.
         """
+        # KroneckerLinearSolver: keep applying the function (not its dense matrix) to device data
+        dense_on_device = False
+
         def __init__(self, function):
             self._function = function
 
