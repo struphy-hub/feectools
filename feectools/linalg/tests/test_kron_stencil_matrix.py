@@ -136,16 +136,21 @@ def make_space(comm, npts, pads, periods, mpi_dims_mask=None):
     return StencilVectorSpace(cart)
 
 
-def make_factor(W, grp, mpads, seed):
+def make_factor(W, grp, mpads, seed, full_rows=False, rows=None):
     """
-    Process-local factor on the axes grp of W (rows owned by this process),
-    with band mpads and random entries; also returns the global dense matrix.
+    Process-local factor on the axes grp of W (rows owned by this process, all rows if
+    full_rows, or the given (starts, ends)), with band mpads and random entries; also
+    returns the global dense matrix.
     """
     npts    = [W.npts[a] for a in grp]
     periods = [W.periods[a] for a in grp]
     spads   = list(mpads)  # factor space pads may be smaller than the ones of W
     starts  = [W.starts[a] for a in grp]
     ends    = [W.ends[a] for a in grp]
+    if full_rows:
+        starts, ends = [0] * len(grp), [n - 1 for n in npts]
+    if rows is not None:
+        starts, ends = rows
 
     D    = DomainDecomposition([n-1 for n in npts], periods=periods)
     cart = CartDecomposition(D, npts, [np.array([s]) for s in starts], [np.array([e]) for e in ends],
@@ -201,14 +206,14 @@ def assert_local_equal(W, y, expected):
     assert np.allclose(y_loc, expected.reshape(tuple(W.npts))[local_slices(W)], rtol=1e-12, atol=1e-12)
 
 
-def make_kron(W, factor_ndims, mpads, seed):
+def make_kron(W, factor_ndims, mpads, seed, full_rows=False):
     axes, d = [], 0
     for n in factor_ndims:
         axes.append(tuple(range(d, d + n)))
         d += n
     mats, dense = [], []
     for k, grp in enumerate(axes):
-        M, Md = make_factor(W, grp, [mpads[a] for a in grp], seed + k)
+        M, Md = make_factor(W, grp, [mpads[a] for a in grp], seed + k, full_rows=full_rows)
         mats.append(M)
         dense.append(Md)
     from functools import reduce as _reduce
@@ -468,3 +473,54 @@ def test_kron_sum_solver_ser(sigma, with_none):
 @pytest.mark.parametrize('with_none', [False, True])
 def test_kron_sum_solver_par(sigma, with_none):
     check_sum_solver(MPI.COMM_WORLD, sigma, with_none)
+
+
+#===============================================================================
+# Row layout of the factors, duplicate entries of periodic factors
+#===============================================================================
+def check_full_row_factors(comm, factor_ndims):
+    """Factors owning all rows (not only the ones of W on this process)."""
+    W = make_space(comm, NPTS, PADS, PERIODS)
+    M, Md, _, _ = make_kron(W, factor_ndims, [1, 2, 2], seed=60, full_rows=True)
+    w, wglob = random_vector(W, seed=6)
+    assert_local_equal(W, M.dot(w), Md @ wglob)
+    rows = local_rows(W)
+    assert np.allclose(M.tostencil().tosparse().tocsr()[rows].toarray(), Md[rows])
+
+
+@pytest.mark.parametrize('factor_ndims', [(1, 1, 1), (2, 1)])
+def test_kron_full_row_factors_ser(factor_ndims):
+    check_full_row_factors(None, factor_ndims)
+
+@pytest.mark.mpi
+@pytest.mark.parametrize('factor_ndims', [(1, 1, 1), (2, 1)])
+def test_kron_full_row_factors_par(factor_ndims):
+    check_full_row_factors(MPI.COMM_WORLD, factor_ndims)
+
+
+def test_kron_factor_rows_must_contain_local_rows():
+    W = make_space(None, NPTS, PADS, PERIODS)
+    good = [make_factor(W, (a,), [1], seed=a)[0] for a in range(3)]
+    # factor on axis 0 owning only the rows 1, ..., n-1 (row 0 of W is missing)
+    bad = make_factor(W, (0,), [1], seed=0, rows=([1], [NPTS[0] - 1]))[0]
+    with pytest.raises(ValueError):
+        KroneckerStencilMatrix(W, W, bad, *good[1:])
+
+
+def check_matmul_periodic_duplicates(comm):
+    """Periodic direction with 2p + 1 > n: two diagonals hit the same column."""
+    npts, pads, periods = [4, 7, 8], [2, 2, 3], [True, False, True]
+    W = make_space(comm, npts, pads, periods, mpi_dims_mask=[False, True, True])
+    A, Ad, _, _ = make_kron(W, (1, 1, 1), [2, 1, 2], seed=70)
+    B, Bd, _, _ = make_kron(W, (1, 1, 1), [2, 2, 1], seed=80)
+    rows = local_rows(W)
+    C = A @ B
+    assert np.allclose(C.tosparse().tocsr()[rows].toarray(), (Ad @ Bd)[rows])
+
+
+def test_kron_matmul_periodic_duplicates_ser():
+    check_matmul_periodic_duplicates(None)
+
+@pytest.mark.mpi
+def test_kron_matmul_periodic_duplicates_par():
+    check_matmul_periodic_duplicates(MPI.COMM_WORLD)

@@ -34,9 +34,10 @@ class KroneckerStencilMatrix(LinearOperator):
 
         M = KroneckerStencilMatrix(V, W, A_xy, A_z)    # M.axes == ((0, 1), (2,))
 
-    The factors are process-local: along its axes, the factor $A_k$ owns the
-    same rows (``starts``/``ends``) as the codomain ``W`` on this process,
-    but it lives on its own spaces, without a communicator. The pads of the
+    The factors are process-local: they live on their own spaces, without a
+    communicator, and along its axes the factor $A_k$ owns (at least) the rows
+    (``starts``/``ends``) of the codomain ``W`` on this process, e.g. exactly
+    these rows or all rows. The pads of the
     factors must not exceed the pads of the domain ``V``, whose ghost regions
     are read by ``dot``.
 
@@ -83,6 +84,14 @@ class KroneckerStencilMatrix(LinearOperator):
             d += n
         assert d == V.ndim, \
             f'The factors cover {d} axes, but the domain has {V.ndim}.'
+
+        # dot reads the rows of W on this process from the factors
+        for A, grp in zip(args, axes):
+            for k, a in enumerate(grp):
+                if not A.codomain.starts[k] <= W.starts[a] <= W.ends[a] <= A.codomain.ends[k]:
+                    raise ValueError(f'The factor on axes {grp} owns the rows {A.codomain.starts[k]}..'
+                                     f'{A.codomain.ends[k]} along axis {a}, which do not contain the rows '
+                                     f'{W.starts[a]}..{W.ends[a]} of the codomain on this process.')
 
         # dot reads the ghost regions of x, so the band must fit into them
         for A, grp in zip(args, axes):
@@ -180,7 +189,7 @@ class KroneckerStencilMatrix(LinearOperator):
 
         # per axis: band of the factor, row offset in its data array and ghost offset of x
         mpads   = tuple(p for A in mats for p in A.pads)
-        row_off = tuple(p*m for A in mats for p,m in zip(A.codomain.pads, A.codomain.shifts))
+        row_off = self._row_offsets()
         x_off   = tuple(p*m for p,m in zip(self._domain.pads, self._domain.shifts))
         pnrows  = tuple(2*p+1 for p in mpads)
 
@@ -266,6 +275,16 @@ class KroneckerStencilMatrix(LinearOperator):
                     for A,grp in zip(self.mats, self.axes)]
         return reduce(lambda a, b: a * b, elements, 1)
 
+    def _row_offsets(self) -> tuple[int, ...]:
+        """
+        Per axis: index in the data array of its factor of the first local row of the codomain
+        (ghost region of the factor plus the offset between the first rows of codomain and factor).
+        """
+        return tuple(p*m + s - fs
+                     for A, grp in zip(self.mats, self.axes)
+                     for p, m, fs, s in zip(A.codomain.pads, A.codomain.shifts, A.codomain.starts,
+                                            (self._codomain.starts[a] for a in grp)))
+
     def tostencil(self) -> StencilMatrix:
         """Convert to a StencilMatrix on the domain and codomain."""
 
@@ -285,7 +304,7 @@ class KroneckerStencilMatrix(LinearOperator):
         M  = StencilMatrix(self.domain, self.codomain, pads=tuple(pads))
 
         # row offset of each axis in the data array of its factor
-        row_off = [p*m for A in mats for p,m in zip(A.codomain.pads, A.codomain.shifts)]
+        row_off = list(self._row_offsets())
 
         mats = [mat._data for mat in mats]
 
@@ -523,8 +542,11 @@ def _multiply_factors(A: StencilMatrix, B: StencilMatrix, U: StencilVectorSpace)
     assert tuple(A.domain.npts) == tuple(B.codomain.npts)
     assert tuple(A.codomain.periods) == tuple(B.domain.periods)
 
-    # all rows of B that rows of A on this process can couple to
+    # all rows of B that rows of A on this process can couple to; first sum duplicate entries
+    # (periodic factors with 2p + 1 > n have two diagonals in the same column), so that only rows
+    # replicated on several processes are removed below
     B_sp = B.tosparse().tocoo()
+    B_sp.sum_duplicates()
     if U.parallel:
         parts = U.cart.comm.allgather((B_sp.row, B_sp.col, B_sp.data))
         rows  = np.concatenate([p[0] for p in parts]).astype(np.int64)
