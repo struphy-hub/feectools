@@ -300,9 +300,12 @@ class StencilVectorSpace(VectorSpace):
 
         Returns
         -------
-        float | complex
+        float | complex | cupy.ndarray
             The scalar product of the two vectors. Note that inner(x, x) is
             a non-negative real number which is zero if and only if x = 0.
+            A NumPy scalar for NumPy data; for device (CuPy) data a 0-d
+            device array, so that the result stays on the device (no copy
+            to the host, no synchronization).
 
         """
 
@@ -324,10 +327,14 @@ class StencilVectorSpace(VectorSpace):
             self.cart.global_comm.Allreduce((x._dot_send_data, self.mpi_type),
                                             (x._dot_recv_data, self.mpi_type),
                                              op=MPI.SUM )
-            return x._dot_recv_data[0]
-        else:
-            # a NumPy scalar on both backends
-            return xp.to_numpy(res)[0]
+            res = x._dot_recv_data
+
+        if xp.is_gpu(res):
+            # A 0-d device array. Copied (on the device), because res is a buffer
+            # of x that the next inner product with x overwrites.
+            return res[0].copy()
+        # a NumPy scalar
+        return res[0]
 
     # ...
     def axpy(self, a, x, y):
@@ -339,7 +346,9 @@ class StencilVectorSpace(VectorSpace):
         Parameters
         ----------
         a : scalar
-            The scaling coefficient needed for the operation.
+            The scaling coefficient needed for the operation. A Python or
+            NumPy scalar, or a 0-d device array (e.g. the result of `inner`
+            on device data), which is not copied to the host.
 
         x : StencilVector
             The vector which is not modified by this function.
@@ -351,6 +360,18 @@ class StencilVectorSpace(VectorSpace):
         assert isinstance(y, StencilVector)
         assert x._space is self
         assert y._space is self
+
+        if xp.is_gpu(a):
+            # A device scalar, e.g. the result of an inner product: converting it
+            # to a Python scalar for the kernel would copy it to the host and wait
+            # for the device, so y += a * x is computed with array operations.
+            if self.dtype != complex and xp.iscomplexobj(a):
+                raise TypeError('A complex scalar was given in a real case')
+            y._data += a * x._data
+            for axis, ext in self.interfaces:
+                y._interface_data[axis, ext] += a * x._interface_data[axis, ext]
+            y._sync = x._sync and y._sync
+            return
 
         if self.dtype == complex:
             a = complex(a)

@@ -283,6 +283,31 @@ def test_fewer_diagonals_dot_and_transpose_match_global_reference():
 
 
 # ===============================================================================
+def test_inner_result_is_a_copy_of_the_reduction_buffer():
+    """The result of the MPI reduction survives the next inner product with the same vector.
+
+    `inner` reduces into a buffer of the first vector; on the device it returns a 0-d
+    device array (no copy to the host), which must not be a view of that buffer.
+    """
+    comm = MPI.COMM_WORLD
+    V = make_space(NPTS, PADS, comm=comm)
+    glob = global_field(NPTS)
+    other = np.flipud(glob).copy()
+
+    x = scatter(V, glob)
+    y = scatter(V, other)
+
+    xy = x.inner(y)
+    xx = x.inner(x)
+    if xp.is_gpu(x._data):
+        assert xp.is_gpu(xy) and xy.ndim == 0
+    else:
+        assert isinstance(xy, np.floating)
+    assert abs(float(xy) - float((glob * other).sum())) <= 1e-9
+    assert abs(float(xx) - float((glob * glob).sum())) <= 1e-9
+
+
+# ===============================================================================
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, '-v', '--with-mpi']))

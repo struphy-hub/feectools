@@ -93,9 +93,11 @@ class VectorSpace(ABC):
 
         Returns
         -------
-        float | complex
+        float | complex | cupy.ndarray
             The scalar product of the two vectors. Note that inner(x, x) is
             a non-negative real number which is zero if and only if x = 0.
+            For vectors with device (CuPy) data, a 0-d device array: the
+            result stays on the device.
 
         """
 

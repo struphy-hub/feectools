@@ -26,6 +26,27 @@ __all__ = (
 )
 
 #===============================================================================
+# Scalars on the device
+#
+# On the CuPy backend `Vector.inner` returns a 0-d device array. The Krylov
+# solvers below (CG, PCG, BiCG, BiCGStab, PBiCGStab) keep their step sizes
+# (alpha, beta, omega, ...) on the device: arithmetic with 0-d device arrays
+# and `axpy` with a device scalar do not copy to the host. The only copy per
+# iteration is the 8-byte residual norm of the convergence test, made explicit
+# with `_host`. MINRES, LSMR and the Uzawa solver do their scalar recurrences
+# on the host and copy every inner product (as before). On the NumPy backend
+# nothing changes: both helpers return their argument as it is.
+#===============================================================================
+def _host(s):
+    """A device scalar (0-d CuPy array) as a NumPy scalar (one copy to the host); anything else unchanged."""
+    return xp.to_numpy(s)[()] if xp.is_gpu(s) else s
+
+
+def _sqrt(s):
+    """Square root that keeps a device scalar on the device; `math.sqrt` for host scalars."""
+    return xp.sqrt(s) if xp.is_gpu(s) else sqrt(s)
+
+#===============================================================================
 def inverse(A, solver, **kwargs):
     """
     A function to create objects of all InverseLinearOperator subclasses.
@@ -205,11 +226,12 @@ class ConjugateGradient(InverseLinearOperator):
             print( "+ Iter. # | L2-norm of residual |")
             print( "+---------+---------------------+")
             template = "| {:7d} | {:19.2e} |"
-            print(template.format(1, sqrt(am)))
+            print(template.format(1, sqrt(_host(am))))
 
         # Iterate to convergence
         for m in range(2, maxiter+1):
-            if am < tol_sqr:
+            # the only copy to the host per iteration (with device vectors)
+            if _host(am) < tol_sqr:
                 m -= 1
                 break
             A.dot(p, out=v)
@@ -223,12 +245,13 @@ class ConjugateGradient(InverseLinearOperator):
             p  += r
             am  = am1
             if verbose:
-                print(template.format(m, sqrt(am)))
+                print(template.format(m, sqrt(_host(am))))
 
         if verbose:
             print( "+---------+---------------------+")
 
         # Convergence information
+        am = _host(am)
         self._info = {'niter': m, 'success': am < tol_sqr, 'res_norm': sqrt(am) }
 
         if recycle:
@@ -368,12 +391,13 @@ class PConjugateGradient(InverseLinearOperator):
             print( "+ Iter. # | L2-norm of residual |")
             print( "+---------+---------------------+")
             template = "| {:7d} | {:19.2e} |"
-            print( template.format(1, sqrt(nrmr_sqr)))
+            print( template.format(1, sqrt(_host(nrmr_sqr))))
 
         # Iterate to convergence
         for k in range(2, maxiter+1):
 
-            if nrmr_sqr < tol_sqr:
+            # the only copy to the host per iteration (with device vectors)
+            if _host(nrmr_sqr) < tol_sqr:
                 k -= 1
                 break
 
@@ -395,12 +419,13 @@ class PConjugateGradient(InverseLinearOperator):
             am  = am1
 
             if verbose:
-                print( template.format(k, sqrt(nrmr_sqr)))
+                print( template.format(k, sqrt(_host(nrmr_sqr))))
 
         if verbose:
             print( "+---------+---------------------+")
 
         # Convergence information
+        nrmr_sqr = _host(nrmr_sqr)
         self._info = {'niter': k, 'success': nrmr_sqr < tol_sqr, 'res_norm': sqrt(nrmr_sqr) }
 
         if recycle:
@@ -540,7 +565,8 @@ class BiConjugateGradient(InverseLinearOperator):
         # Iterate to convergence
         for m in range(1, maxiter + 1):
 
-            if res_sqr < tol_sqr:
+            # the only copy to the host per iteration (with device vectors)
+            if _host(res_sqr) < tol_sqr:
                 m -= 1
                 break
 
@@ -585,12 +611,13 @@ class BiConjugateGradient(InverseLinearOperator):
             ps += rs
 
             if verbose:
-                print( template.format(m, sqrt(res_sqr)) )
+                print( template.format(m, sqrt(_host(res_sqr))) )
 
         if verbose:
             print( "+---------+---------------------+")
 
         # Convergence information
+        res_sqr = _host(res_sqr)
         self._info = {'niter': m, 'success': res_sqr < tol_sqr, 'res_norm': sqrt(res_sqr)}
 
         if recycle:
@@ -729,12 +756,12 @@ class BiConjugateGradientStabilized(InverseLinearOperator):
             print("+---------+---------------------+")
             template = "| {:7d} | {:19.2e} |"
 
-        # Iterate to convergence
-        for m in range(1, maxiter + 1):
-
-            if res_sqr < tol_sqr:
-                m -= 1
-                break
+        # Iterate to convergence. The residual is tested once per iteration,
+        # after its update (the only copy to the host per iteration with device
+        # vectors); before the first iteration it is tested here.
+        n_iter = 0 if _host(res_sqr) < tol_sqr else maxiter
+        m = 0
+        for m in range(1, n_iter + 1):
 
             # -----------------------
             # MATRIX-VECTOR PRODUCTS
@@ -771,7 +798,7 @@ class BiConjugateGradientStabilized(InverseLinearOperator):
             # ||r||_2 := (r, r)
             res_sqr = r.inner(r).real
 
-            if res_sqr < tol_sqr:
+            if _host(res_sqr) < tol_sqr:
                 break
 
             # b := a / w * (r0, r)_{m+1} / (r0, r)_m
@@ -783,12 +810,13 @@ class BiConjugateGradientStabilized(InverseLinearOperator):
             p.mul_iadd(-b * w, v)
 
             if verbose:
-                print(template.format(m, sqrt(res_sqr)))
+                print(template.format(m, sqrt(_host(res_sqr))))
 
         if verbose:
             print("+---------+---------------------+")
 
         # Convergence information
+        res_sqr = _host(res_sqr)
         self._info = {'niter': m, 'success': res_sqr < tol_sqr, 'res_norm': sqrt(res_sqr)}
 
         if recycle:
@@ -963,7 +991,8 @@ class PBiConjugateGradientStabilized(InverseLinearOperator):
         # iterate to convergence or maximum number of iterations
         niter = 0
 
-        while res_sqr > tol_sqr and niter < maxiter:
+        # the only copy to the host per iteration (with device vectors)
+        while _host(res_sqr) > tol_sqr and niter < maxiter:
 
             # v = A @ pp, vp = PC @ v, alphap = rhop/(vp.rp0)
             A.dot(pp, out=v)
@@ -1016,12 +1045,13 @@ class PBiConjugateGradientStabilized(InverseLinearOperator):
             niter += 1
 
             if verbose:
-                print(template.format(niter, sqrt(res_sqr)))
+                print(template.format(niter, sqrt(_host(res_sqr))))
 
         if verbose:
             print("+---------+---------------------+")
 
         # convergence information
+        res_sqr = _host(res_sqr)
         self._info = {'niter': niter, 'success': res_sqr <
                 tol_sqr, 'res_norm': sqrt(res_sqr)}
 
@@ -1171,7 +1201,7 @@ class MinimumResidual(InverseLinearOperator):
         y *= -1.0
         y.copy(out=res_old)   # res = b - A*x
 
-        beta = sqrt(res_old.inner(res_old))
+        beta = sqrt(_host(res_old.inner(res_old)))
 
         # Initialize other quantities
         oldb    = 0
@@ -1215,7 +1245,7 @@ class MinimumResidual(InverseLinearOperator):
             if itn >= 2:
                 y.mul_iadd(-(beta/oldb), res_old)
 
-            alfa = v.inner(y)
+            alfa = _host(v.inner(y))
             y.mul_iadd(-(alfa/beta), res_new)
 
             # We put res_new in res_old and y in res_new
@@ -1223,7 +1253,7 @@ class MinimumResidual(InverseLinearOperator):
             y.copy(out=res_new)
 
             oldb = beta
-            beta = sqrt(res_new.inner(res_new))
+            beta = sqrt(_host(res_new.inner(res_new)))
             tnorm2 += alfa**2 + oldb**2 + beta**2
 
             # Apply previous rotation Qk-1 to get
@@ -1270,7 +1300,7 @@ class MinimumResidual(InverseLinearOperator):
             # Estimate various norms and test for convergence.
 
             Anorm = sqrt(tnorm2)
-            ynorm = sqrt(x.inner(x))
+            ynorm = sqrt(_host(x.inner(x)))
 
             rnorm  = phibar
             if ynorm == 0 or Anorm == 0:test1 = inf
@@ -1486,16 +1516,16 @@ class LSMR(InverseLinearOperator):
             btol = tol
 
         b.copy(out=u)
-        normb = sqrt(b.inner(b).real)
+        normb = sqrt(_host(b.inner(b)).real)
 
         A.dot(x, out=u_work)
         u -= u_work
-        beta = sqrt(u.inner(u).real)
+        beta = sqrt(_host(u.inner(u)).real)
 
         if beta > 0:
             u *= (1 / beta)
             At.dot(u, out=v)
-            alpha = sqrt(v.inner(v).real)
+            alpha = sqrt(_host(v.inner(v)).real)
         else:
             x.copy(out=v)
             alpha = 0
@@ -1558,14 +1588,14 @@ class LSMR(InverseLinearOperator):
             u *= -alpha
             A.dot(v, out=u_work)
             u += u_work
-            beta = sqrt(u.inner(u).real)
+            beta = sqrt(_host(u.inner(u)).real)
 
             if beta > 0:
                 u     *= (1 / beta)
                 v     *= -beta
                 At.dot(u, out=v_work)
                 v     += v_work
-                alpha = sqrt(v.inner(v).real)
+                alpha = sqrt(_host(v.inner(v)).real)
                 if alpha > 0:v *= (1 / alpha)
 
             # At this point, beta = beta_{k+1}, alpha = alpha_{k+1}.
@@ -1642,7 +1672,7 @@ class LSMR(InverseLinearOperator):
 
             # Compute norms for convergence testing.
             normar = abs(zetabar)
-            normx  = sqrt(x.inner(x).real)
+            normx  = sqrt(_host(x.inner(x)).real)
 
             # Now use these norms to estimate certain other quantities,
             # some of which will be small near a solution.
@@ -1807,7 +1837,7 @@ class GMRES(InverseLinearOperator):
         A.dot( x , out=r)
         r -= b
 
-        am = sqrt(r.inner(r).real)
+        am = sqrt(_host(r.inner(r).real))
         if am < tol:
             self._info = {'niter': 1, 'success': am < tol, 'res_norm': am }
             return x
@@ -1884,7 +1914,7 @@ class GMRES(InverseLinearOperator):
             h[i] = p.inner(self._Q[i])
             p.mul_iadd(-h[i], self._Q[i])
         
-        h[k+1] = sqrt(p.inner(p).real)
+        h[k+1] = _sqrt(p.inner(p).real)
         p /= h[k+1] # Normalize vector
 
         if len(self._Q) > k + 1:
@@ -2007,7 +2037,7 @@ class UzawaSolver(InverseLinearOperator):
 
             # constraint residual: R = B1*u + B2*ue - g
             R = B1.dot(u) + B2.dot(ue) - g
-            residual_norm = sqrt(R.inner(R).real)
+            residual_norm = sqrt(_host(R.inner(R)).real)
 
             if verbose:
                 print(template.format(iteration, residual_norm))
@@ -2017,7 +2047,7 @@ class UzawaSolver(InverseLinearOperator):
 
             # pressure update: steepest descent step size
             S_R   = B1.dot(A11inv.dot(B1.T.dot(R))) + B2.dot(A22inv.dot(B2.T.dot(R)))
-            alpha = R.inner(R).real / R.inner(S_R).real
+            alpha = _host(R.inner(R)).real / _host(R.inner(S_R)).real
             p    += alpha * R
 
         if verbose:

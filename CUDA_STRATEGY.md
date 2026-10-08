@@ -234,6 +234,34 @@ Conventions, as in struphy:
 - GPU tests are skipped without CuPy and a GPU (`cunumpy.kernel_testing.requires_cupy`). Until a GPU runner exists,
   they are run by hand on an H100 before a PR that touches CUDA code is merged, and the PR description says so.
 
+## Inner products on the device
+
+`StencilVectorSpace.inner` (and so `StencilVector.inner`, `BlockVectorSpace.inner`, `dot_inner`) returns a 0-d
+CuPy array for device data, in the serial and the MPI case (the `Allreduce` works on the device buffers, after
+`synchronize_for_mpi`); before, the serial case copied the 8-byte result to the host. The result is a copy of the
+reduction buffer, which the next inner product with the same vector overwrites. On NumPy it is a NumPy scalar, as
+before.
+
+- `StencilVectorSpace.axpy` with a 0-d device array computes `y += a * x` with array operations (the axpy kernel
+  takes `alpha` by value, so calling it would copy `a` to the host and wait for the device).
+- CG, PCG, BiCG, BiCGStab and PBiCGStab keep their step sizes on the device; the only copy per iteration is the
+  residual norm of the convergence test (`solvers._host`). BiCGStab tested the residual twice per iteration (once
+  redundantly); it now tests it once. MINRES, LSMR and the Uzawa solver do their scalar recurrences on the host
+  and copy every inner product, as before; GMRES keeps its Arnoldi inner products on the device.
+- Copies to the host per iteration, counted under the fake CuPy (`linalg/tests/test_inner_on_device.py`, which
+  also counts implicit conversions such as `float()`, invisible to `count_transfers`):
+
+  | Solver | before | after |
+  | --- | --- | --- |
+  | CG | 2 | 1 |
+  | PCG | 3 | 1 |
+  | BiCG | 4 | 1 |
+  | BiCGStab | 6 | 1 |
+  | PBiCGStab | 5 | 1 |
+  | MINRES, LSMR | 3 | 3 |
+
+  Iteration counts and solutions are identical to NumPy.
+
 ## Open questions
 
 - **Setup kernels on the GPU.** B-spline, field evaluation and DOF kernels still run on the host through
@@ -245,8 +273,11 @@ Conventions, as in struphy:
   layout first.
 - **Complex data on the device.** Not needed by struphy so far; would need a second CUDA kernel per folder (or
   dtype dispatch in `cunumpy.kernels.Kernel`).
-- **`inner` reduction.** One `atomicAdd` per block of 256 threads, then a copy of the 8-byte result to the host in
-  the serial case (in the parallel case it goes into the MPI reduction). To be measured on the H100.
+- **`inner` reduction.** One `atomicAdd` per block of 256 threads; the result stays on the device (see
+  [Inner products on the device](#inner-products-on-the-device)). To be measured on the H100.
+- **Fewer convergence tests.** The Krylov solvers still copy the residual norm to the host once per iteration.
+  Testing it every k iterations would remove most of these synchronizations, at the cost of up to k - 1 extra
+  iterations (which must not divide by a zero residual) and of iteration counts that differ from NumPy.
 - **Interface matrices** (`StencilInterfaceMatrix`) and the remaining stencil kernels (`stencil2coo`, ...) still use
   `PyccelKernel` with host copies.
 - **FFT on the device.** `DistributedFFT` and friends still stage their data through the host (SciPy FFT); they
