@@ -1,4 +1,7 @@
 #coding = utf-8
+from __future__ import annotations
+
+from collections.abc import Sequence
 from functools import reduce
 
 import numpy as np
@@ -7,6 +10,7 @@ from cunumpy.mpi import synchronize_for_mpi
 from scipy.sparse import kron
 from scipy.sparse import coo_matrix
 
+from feectools.ddm.cart       import CartDecomposition
 from feectools.linalg.basic   import LinearOperator, LinearSolver
 from feectools.linalg.stencil import StencilVectorSpace, StencilVector, StencilMatrix
 
@@ -17,8 +21,26 @@ __all__ = ('KroneckerStencilMatrix',
 
 #==============================================================================
 class KroneckerStencilMatrix(LinearOperator):
-    """
-    Kronecker product of 1D stencil matrices.
+    r"""
+    Kronecker product $M = A_1 \otimes A_2 \otimes \dots \otimes A_m$ of stencil matrices.
+
+    Each factor $A_k$ is a StencilMatrix acting on a group of consecutive
+    axes of the domain and codomain; its number of axes is ``A_k.domain.ndim``.
+    The axes of all factors must add up to ``V.ndim``. The usual case is one
+    1d factor per axis, but other groupings are allowed, e.g. a 2d x 1d
+    product on a 3d space::
+
+        M = KroneckerStencilMatrix(V, W, A_xy, A_z)    # M.axes == ((0, 1), (2,))
+
+    The factors are process-local: along its axes, the factor $A_k$ owns the
+    same rows (``starts``/``ends``) as the codomain ``W`` on this process,
+    but it lives on its own spaces, without a communicator.
+
+    A product ``M = A @ B`` of two Kronecker matrices with the same axis
+    groups is again a KroneckerStencilMatrix with factors $C_k = A_k B_k$
+    (see ``__matmul__``). The band of $C_k$ is wider than the ghost regions of
+    the domain, so the operands are stored in ``factors`` and ``dot`` applies
+    them one after another.
 
     Parameters
     ----------
@@ -28,70 +50,148 @@ class KroneckerStencilMatrix(LinearOperator):
     W : StencilVectorSpace
         The codomain.
 
-    args : list of StencilMatrix
-        Factors of the Kronecker product (one for each dimension).
+    *args : StencilMatrix
+        Factors of the Kronecker product, ordered by axis. For each factor
+        ``A_k``, ``A_k.domain.npts`` and ``A_k.codomain.npts`` must equal the
+        ``npts`` of ``V`` and ``W`` along the axes of that factor. Unless
+        ``factors`` is given, the pads of ``A_k`` must not exceed the pads
+        of ``V``.
 
+    factors : sequence of KroneckerStencilMatrix, optional
+        Operands $F_1, \dots, F_n$ with $M = F_1 F_2 \cdots F_n$, as created
+        by ``__matmul__``. If given, ``dot`` applies them from right to left.
     """
 
-    def __init__(self, V, W, *args):
+    def __init__(self,
+                 V: StencilVectorSpace,
+                 W: StencilVectorSpace,
+                 *args: StencilMatrix,
+                 factors: Sequence[KroneckerStencilMatrix] | None = None):
 
         assert isinstance(V, StencilVectorSpace)
         assert isinstance(W, StencilVectorSpace)
+        assert V.ndim == W.ndim
+        assert len(args) > 0, 'A KroneckerStencilMatrix needs at least one factor.'
 
-        for i,A in enumerate(args):
-            assert isinstance(A, LinearOperator)
-            assert A.domain.ndim == 1
-            assert A.domain.npts[0] == V.npts[i]
+        # group the axes of V and W by factor
+        axes = []
+        d = 0
+        for A in args:
+            assert isinstance(A, StencilMatrix), \
+                f'Factors must be of type StencilMatrix, got {type(A)}.'
+            n   = A.domain.ndim
+            grp = tuple(range(d, d + n))
+            assert d + n <= V.ndim, \
+                f'The factors have more axes than the domain ({V.ndim}).'
+            assert tuple(A.domain.npts) == tuple(V.npts[d:d+n]), \
+                f'Domain npts {A.domain.npts} of factor on axes {grp} do not match {V.npts}.'
+            assert tuple(A.codomain.npts) == tuple(W.npts[d:d+n]), \
+                f'Codomain npts {A.codomain.npts} of factor on axes {grp} do not match {W.npts}.'
+            axes.append(grp)
+            d += n
+        assert d == V.ndim, \
+            f'The factors cover {d} axes, but the domain has {V.ndim}.'
 
-        self._domain   = V
-        self._codomain = W
-        self._mats     = args
-        self._ndim     = len(args)
+        if factors is None:
+            # dot reads the ghost regions of x, so the band must fit into them
+            for A, grp in zip(args, axes):
+                for p, a in zip(A.pads, grp):
+                    if p > V.pads[a]:
+                        raise ValueError(f'Pads {A.pads} of factor on axes {grp} exceed '
+                                         f'the domain pads {V.pads}; pass the operands '
+                                         'as factors (as done by A @ B).')
+            tmp_vectors = ()
+        else:
+            factors = tuple(factors)
+            assert len(factors) > 0
+            for F in factors:
+                assert isinstance(F, KroneckerStencilMatrix)
+                assert F.axes == tuple(axes)
+            assert factors[0].codomain == W
+            assert factors[-1].domain == V
+            for F, G in zip(factors[:-1], factors[1:]):
+                assert F.domain == G.codomain
+            # intermediate results for dot
+            tmp_vectors = tuple(F.codomain.zeros() for F in factors[1:])
+
+        self._domain      = V
+        self._codomain    = W
+        self._mats        = tuple(args)
+        self._axes        = tuple(axes)
+        self._factors     = factors
+        self._tmp_vectors = tmp_vectors
 
     #--------------------------------------
     # Abstract interface
     #--------------------------------------
     @property
-    def domain( self ):
+    def domain(self) -> StencilVectorSpace:
         return self._domain
 
     # ...
     @property
-    def codomain( self ):
+    def codomain(self) -> StencilVectorSpace:
         return self._codomain
 
     # ...
     @property
-    def dtype( self ):
+    def dtype(self):
         return self.domain.dtype
 
     # ...
     @property
-    def ndim( self ):
-        return self._ndim
-        
+    def ndim(self) -> int:
+        """Number of axes of the domain (not the number of factors, see ``axes``)."""
+        return self._domain.ndim
+
     # ...
     @property
-    def mats( self ):
+    def mats(self) -> tuple[StencilMatrix, ...]:
+        """Factors of the Kronecker product, ordered by axis."""
         return self._mats
 
     # ...
     @property
-    def nbytes( self ):
-        """Local (per-MPI-rank) memory footprint of the 1d factor matrices, in bytes."""
-        return int(sum(getattr(mat, 'nbytes', 0) for mat in self._mats))
+    def axes(self) -> tuple[tuple[int, ...], ...]:
+        """Axes of the domain/codomain on which each factor acts, e.g. ``((0, 1), (2,))``."""
+        return self._axes
 
     # ...
-    def dot(self, x, out=None):
+    @property
+    def factors(self) -> tuple[KroneckerStencilMatrix, ...] | None:
+        """Operands $F_1, \\dots, F_n$ with ``self == F_1 @ ... @ F_n``, or None if ``self`` is not a product."""
+        return self._factors
 
-        dot = xp.dot
+    # ...
+    @property
+    def nbytes(self) -> int:
+        """Local (per-MPI-rank) memory footprint of the factor matrices (and of the stored operands), in bytes."""
+        nbytes = sum(getattr(mat, 'nbytes', 0) for mat in self._mats)
+        if self._factors is not None:
+            nbytes += sum(F.nbytes for F in self._factors)
+        return int(nbytes)
+
+    # ...
+    def dot(self, x: StencilVector, out: StencilVector | None = None) -> StencilVector:
+        """
+        Matrix-vector product ``M @ x``.
+
+        Parameters
+        ----------
+        x : StencilVector
+            Vector in the domain.
+
+        out : StencilVector, optional
+            Vector in the codomain, in which the result is stored.
+
+        Returns
+        -------
+        StencilVector
+            The result, in the codomain (``out`` if given).
+        """
 
         assert isinstance(x, StencilVector)
         assert x.space is self.domain
-
-        # Necessary if vector space is periodic or distributed across processes
-        if not x.ghost_regions_in_sync:
-            x.update_ghost_regions()
 
         if out is not None:
             assert isinstance(out, StencilVector)
@@ -99,22 +199,41 @@ class KroneckerStencilMatrix(LinearOperator):
         else:
             out = StencilVector(self.codomain)
 
+        # product of Kronecker matrices: apply the operands one after another
+        if self._factors is not None:
+            y = x
+            for F, tmp in zip(reversed(self._factors[1:]), reversed(self._tmp_vectors)):
+                y = F.dot(y, out=tmp)
+            return self._factors[0].dot(y, out=out)
+
+        # Necessary if vector space is periodic or distributed across processes
+        if not x.ghost_regions_in_sync:
+            x.update_ghost_regions()
+
         starts = self._codomain.starts
         ends   = self._codomain.ends
         pads   = self._codomain.pads
         shifts = self._codomain.shifts
 
         mats   = self.mats
+        axes   = self.axes
         nrows  = tuple(e-s+1 for s,e in zip(starts, ends))
-        pnrows = tuple(2*p+1 for p in pads)
+
+        # per axis: band of the factor, row offset in its data array and ghost offset of x
+        mpads   = tuple(p for A in mats for p in A.pads)
+        row_off = tuple(p*m for A in mats for p,m in zip(A.codomain.pads, A.codomain.shifts))
+        x_off   = tuple(p*m for p,m in zip(self._domain.pads, self._domain.shifts))
+        pnrows  = tuple(2*p+1 for p in mpads)
 
         for ii in xp.ndindex(*nrows):
             v = 0.
             xx = tuple(i+p*s for i,p,s in zip(ii, pads, shifts))
+            rr = tuple(i+o for i,o in zip(ii, row_off))
 
             for jj in xp.ndindex(*pnrows):
-                i_mats = [mat._data[s, j] for s,j,mat in zip(xx, jj, mats)]
-                ii_jj = tuple(i+j+(s-1)*p for i,j,p,s in zip(ii, jj, pads, shifts))
+                i_mats = [mat._data[(*(rr[a] for a in grp), *(jj[a] for a in grp))]
+                          for mat,grp in zip(mats, axes)]
+                ii_jj = tuple(i+j-p+o for i,j,p,o in zip(ii, jj, mpads, x_off))
                 # ``array_api_compat.cupy`` does not accept a Python list in
                 # ``prod``; multiplying the scalar factors also avoids a
                 # temporary device array in this innermost loop.
@@ -127,46 +246,191 @@ class KroneckerStencilMatrix(LinearOperator):
         return out
 
     # ...
-    def copy(self):
-        mats = [m.copy() for m in self.mats]
-        return KroneckerStencilMatrix(self.domain, self.codomain, *mats)
+    def copy(self) -> KroneckerStencilMatrix:
+        mats    = [m.copy() for m in self.mats]
+        factors = None if self._factors is None else [F.copy() for F in self._factors]
+        return KroneckerStencilMatrix(self.domain, self.codomain, *mats, factors=factors)
 
     # ...
-    def __neg__(self):
-        mats = [-self.mats[0], *(m.copy() for m in self.mats[1:])]
-        return KroneckerStencilMatrix(self.domain, self.codomain, *mats)
+    def __neg__(self) -> KroneckerStencilMatrix:
+        mats    = [-self.mats[0], *(m.copy() for m in self.mats[1:])]
+        factors = None if self._factors is None else \
+            [-self._factors[0], *(F.copy() for F in self._factors[1:])]
+        return KroneckerStencilMatrix(self.domain, self.codomain, *mats, factors=factors)
 
     # ...
-    def __mul__(self, a):
-        mats = [*(m.copy() for m in self.mats[:-1]), self.mats[-1] * a]
-        return KroneckerStencilMatrix(self.domain, self.codomain, *mats)
+    def __mul__(self, a) -> KroneckerStencilMatrix:
+        mats    = [*(m.copy() for m in self.mats[:-1]), self.mats[-1] * a]
+        factors = None if self._factors is None else \
+            [*(F.copy() for F in self._factors[:-1]), self._factors[-1] * a]
+        return KroneckerStencilMatrix(self.domain, self.codomain, *mats, factors=factors)
 
     # ...
-    def __imul__(self, a):
-        self.mats[-1] *= a
+    def __imul__(self, a) -> KroneckerStencilMatrix:
+        last  = self._mats[-1]
+        last *= a
+        if self._factors is not None:
+            last  = self._factors[-1]
+            last *= a
         return self
+
+    # ...
+    def __matmul__(self, B):
+        """
+        Product ``self @ B``.
+
+        If ``B`` is a KroneckerStencilMatrix with the same axis groups, the
+        result is a KroneckerStencilMatrix with factors
+        ``C_k = self.mats[k] @ B.mats[k]``, domain ``B.domain`` and codomain
+        ``self.codomain``. Copies of the operands are stored in
+        ``factors`` (products are flattened, so ``(A @ B) @ C`` has the
+        factors ``(A, B, C)``) and used by ``dot``.
+
+        This is a collective operation if ``B.codomain`` is distributed: each
+        process needs all rows of ``B.mats[k]`` that its rows of
+        ``self.mats[k]`` couple to, so they are gathered.
+
+        In all other cases (a different operator, other axis groups, or a
+        vector) the call is passed to ``LinearOperator.__matmul__``.
+
+        Parameters
+        ----------
+        B : LinearOperator | Vector
+            Right operand. Its codomain must be the domain of ``self``.
+
+        Returns
+        -------
+        KroneckerStencilMatrix | LinearOperator | Vector
+            The product.
+        """
+        if not isinstance(B, KroneckerStencilMatrix) or B.axes != self.axes:
+            return super().__matmul__(B)
+
+        assert self.domain == B.codomain, \
+            'The domain of the left operand must be the codomain of the right operand.'
+
+        mats = [self._multiply_factors(A_k, B_k, B.codomain)
+                for A_k, B_k in zip(self.mats, B.mats)]
+
+        factors = (*(self._factors or (self,)), *(B._factors or (B,)))
+        factors = [F.copy() for F in factors]
+
+        return KroneckerStencilMatrix(B.domain, self.codomain, *mats, factors=factors)
+
+    @staticmethod
+    def _multiply_factors(A: StencilMatrix, B: StencilMatrix, U: StencilVectorSpace) -> StencilMatrix:
+        """
+        Compute the process-local factor ``C = A @ B`` of a Kronecker product.
+
+        The product is computed in scipy sparse format. Its band is wider than
+        the ones of ``A`` and ``B``, so ``C`` is stored on new spaces with
+        the decomposition of ``B.domain`` / ``A.codomain`` and larger pads.
+
+        Parameters
+        ----------
+        A, B : StencilMatrix
+            Process-local factors acting on the same axes.
+
+        U : StencilVectorSpace
+            Codomain of the Kronecker matrix of ``B``. If it is distributed,
+            the rows of ``B`` owned by other processes are gathered over its
+            communicator.
+
+        Returns
+        -------
+        StencilMatrix
+            The product, with rows ``A.codomain.starts`` to ``A.codomain.ends``.
+        """
+        for S in (A.domain, A.codomain, B.domain, B.codomain):
+            if any(m != 1 for m in S.shifts):
+                raise NotImplementedError('Products of factors with shifts != 1 are not supported.')
+        assert tuple(A.domain.npts) == tuple(B.codomain.npts)
+        assert tuple(A.codomain.periods) == tuple(B.domain.periods)
+
+        # all rows of B that rows of A on this process can couple to
+        B_sp = B.tosparse().tocoo()
+        if U.parallel:
+            parts = U.cart.comm.allgather((B_sp.row, B_sp.col, B_sp.data))
+            rows  = np.concatenate([p[0] for p in parts]).astype(np.int64)
+            cols  = np.concatenate([p[1] for p in parts]).astype(np.int64)
+            data  = np.concatenate([p[2] for p in parts])
+            # processes with the same rows along these axes send them twice; keep one copy
+            _, idx = np.unique(rows * B_sp.shape[1] + cols, return_index=True)
+            B_sp = coo_matrix((data[idx], (rows[idx], cols[idx])), shape=B_sp.shape)
+
+        C_sp = (A.tosparse().tocsr() @ B_sp.tocsr()).tocoo()
+
+        # band of C: diagonal offset of each entry along each axis
+        cod, dom = A.codomain, B.domain
+        periods  = cod.periods
+        rr = np.unravel_index(C_sp.row, tuple(cod.npts))
+        cc = np.unravel_index(C_sp.col, tuple(dom.npts))
+        kk = []
+        pads = []
+        for d, (pA, pB, n, P) in enumerate(zip(A.pads, B.pads, dom.npts, periods)):
+            k = cc[d] - rr[d]
+            if P:
+                k = (k + n//2) % n - n//2
+                pads.append(min(pA + pB, n//2))
+            else:
+                pads.append(min(pA + pB, n - 1))
+            kk.append(k)
+            assert k.size == 0 or np.abs(k).max() <= pads[-1]
+
+        # new spaces with the same decomposition and wider pads
+        def widen(S):
+            cart = CartDecomposition(S.cart.domain_decomposition, S.npts,
+                                     S.cart.global_starts, S.cart.global_ends,
+                                     pads=pads, shifts=list(S.shifts))
+            return StencilVectorSpace(cart, dtype=C_sp.dtype)
+
+        C = StencilMatrix(widen(dom), widen(cod))
+
+        index = (*(xp.asarray(r - s + p) for r,s,p in zip(rr, cod.starts, pads)),
+                 *(xp.asarray(k + p) for k,p in zip(kk, pads)))
+        C._data[index] = xp.asarray(C_sp.data)
+
+        return C
 
     #--------------------------------------
     # Other properties/methods
     #--------------------------------------
 
     def __getitem__(self, key):
-        pads = self._codomain.pads
+        """
+        Entry ``M[i_1, ..., i_d, k_1, ..., k_d]`` for row indices ``i`` and
+        diagonal offsets ``k``, i.e. the product of the corresponding entries
+        of the factors.
+        """
         rows = key[:self.ndim]
         cols = key[self.ndim:]
-        mats = self.mats
-        elements = [A[i,j] for A,i,j in zip(mats, rows, cols)]
+        elements = [A[(*(rows[a] for a in grp), *(cols[a] for a in grp))]
+                    for A,grp in zip(self.mats, self.axes)]
         return reduce(lambda a, b: a * b, elements, 1)
 
-    def tostencil(self):
+    def tostencil(self) -> StencilMatrix:
+        """
+        Convert to a StencilMatrix on the domain and codomain.
+
+        Raises
+        ------
+        ValueError
+            If the band of a factor exceeds the domain pads, e.g. for a product
+            created by ``A @ B``; use ``tosparse`` instead.
+        """
 
         mats  = self.mats
         ssc   = self.codomain.starts
         eec   = self.codomain.ends
         ssd   = self.domain.starts
         eed   = self.domain.ends
-        pads  = [A.pads[0] for A in self.mats]
+        pads  = [p for A in self.mats for p in A.pads]
         xpads = self.domain.pads
+
+        if any(p > xp_ for p,xp_ in zip(pads, xpads)):
+            raise ValueError(f'The pads {tuple(pads)} of the factors exceed the domain pads '
+                             f'{xpads}, so the matrix does not fit into a StencilMatrix on '
+                             'its domain; use tosparse instead.')
 
         # Number of rows in matrix (along each dimension)
         nrows       = [ed-s+1 for s,ed in zip(ssd, eed)]
@@ -175,13 +439,16 @@ class KroneckerStencilMatrix(LinearOperator):
         # create the stencil matrix
         M  = StencilMatrix(self.domain, self.codomain, pads=tuple(pads))
 
+        # row offset of each axis in the data array of its factor
+        row_off = [p*m for A in mats for p,m in zip(A.codomain.pads, A.codomain.shifts)]
+
         mats = [mat._data for mat in mats]
 
-        self._tostencil(M._data, mats, nrows, nrows_extra, pads, xpads)
+        self._tostencil(M._data, mats, self.axes, nrows, nrows_extra, pads, xpads, row_off)
         return M
 
     @staticmethod
-    def _tostencil(M, mats, nrows, nrows_extra, pads, xpads):
+    def _tostencil(M, mats, axes, nrows, nrows_extra, pads, xpads, row_off):
 
         ndiags = [2*p + 1 for p in pads]
         diff   = [xp-p for xp,p in zip(xpads, pads)]
@@ -190,12 +457,14 @@ class KroneckerStencilMatrix(LinearOperator):
         for xx in xp.ndindex( *nrows ):
 
             ii = tuple(xp + x for xp, x in zip(xpads, xx) )
+            rr = tuple(o + x for o, x in zip(row_off, xx) )
 
             for kk in xp.ndindex( *ndiags ):
 
-                values        = [mat[i,k] for mat,i,k in zip(mats, ii, kk)]
+                values        = [mat[(*(rr[a] for a in grp), *(kk[a] for a in grp))]
+                                 for mat,grp in zip(mats, axes)]
                 M[(*ii, *kk)] = reduce(lambda a, b: a * b, values, 1)
-        
+
         # handle partly-multiplied rows
         new_nrows = nrows.copy()
         for d,er in enumerate(nrows_extra):
@@ -209,6 +478,7 @@ class KroneckerStencilMatrix(LinearOperator):
                     xx.insert(d, nrows[d]+n)
 
                     ii     = tuple(x+xp for x,xp in zip(xx, xpads))
+                    rr     = tuple(x+o for x,o in zip(xx, row_off))
                     ee     = [max(x-l+1,0) for x,l in zip(xx, nrows)]
                     jj     = tuple( slice(x+d, x+d+2*p+1-e) for x,p,d,e in zip(xx, pads, diff, ee) )
                     ndiags = [2*p + 1-e for p,e in zip(pads,ee)]
@@ -216,19 +486,30 @@ class KroneckerStencilMatrix(LinearOperator):
                     ii_kk  = tuple( list(ii) + kk )
 
                     for kk in xp.ndindex( *ndiags ):
-                        values        = [mat[i,k] for mat,i,k in zip(mats, ii, kk)]
+                        values        = [mat[(*(rr[a] for a in grp), *(kk[a] for a in grp))]
+                                         for mat,grp in zip(mats, axes)]
                         M[(*ii, *kk)] = reduce(lambda a, b: a * b, values, 1)
             new_nrows[d] += er
 
     def tosparse(self):
+        """Convert the local rows to a scipy sparse matrix (Kronecker product of the factors' ``tosparse``)."""
         return reduce(kron, (m.tosparse() for m in self.mats))
 
     def toarray(self):
+        """Convert the local rows to a dense array."""
         return self.tosparse().toarray()
 
-    def transpose(self, conjugate=False):
+    def transpose(self, conjugate: bool = False) -> KroneckerStencilMatrix:
+        """
+        Transpose of the matrix (Hermitian transpose if ``conjugate`` is True).
+
+        The factors are transposed; for a product the order of the operands
+        is reversed.
+        """
         mats_tr = [Mi.transpose(conjugate=conjugate) for Mi in self.mats]
-        return KroneckerStencilMatrix(self.codomain, self.domain, *mats_tr)
+        factors = None if self._factors is None else \
+            [F.transpose(conjugate=conjugate) for F in reversed(self._factors)]
+        return KroneckerStencilMatrix(self.codomain, self.domain, *mats_tr, factors=factors)
 
 #==============================================================================
 class KroneckerDenseMatrix(LinearOperator):
@@ -383,9 +664,19 @@ class KroneckerDenseMatrix(LinearOperator):
         pass
 #==============================================================================
 class KroneckerLinearSolver(LinearOperator):
-    """
-    A solver for Ax=b, where A is a Kronecker matrix from arbirary dimension d,
-    defined by d solvers. We also need information about the space of b.
+    r"""
+    Solver for $A x = b$, where $A = A_1 \otimes A_2 \otimes \dots \otimes A_m$
+    is a Kronecker product given by one solver per factor.
+
+    Each factor acts on a group of consecutive axes of the space; by default
+    every factor is 1d (one solver per axis). For other groupings, pass
+    ``factor_ndims``, e.g. ``factor_ndims=(2, 1)`` for a 2d x 1d product on a
+    3d space. A solver of a factor with several axes receives the vectors
+    flattened in C order over these axes (as in ``StencilMatrix.tosparse``).
+
+    Factors are solved in parallel (with MPI_Alltoallv) along a distributed
+    axis. This is only implemented for 1d factors: a factor with several
+    axes must not be distributed across processes along any of its axes.
 
     Parameters
     ----------
@@ -396,10 +687,13 @@ class KroneckerLinearSolver(LinearOperator):
     W : StencilVectorSpace
         The space x will live in; i.e. which gives us information about
         the distribution of the unknown vector x.
-    
-    solvers : list of LinearSolver
-        The components of A in each dimension.
-    
+
+    solvers : sequence of LinearSolver
+        Solvers for the factors of A, ordered by axis.
+
+    factor_ndims : sequence of int, optional
+        Number of axes of each factor. Defaults to 1 for every factor.
+
     Attributes
     ----------
     domain : StencilVectorSpace
@@ -408,28 +702,49 @@ class KroneckerLinearSolver(LinearOperator):
     codomain : StencilVectorSpace
         The space of the unknown vector x.
     """
-    def __init__(self, V, W, solvers):
+    def __init__(self,
+                 V: StencilVectorSpace,
+                 W: StencilVectorSpace,
+                 solvers: Sequence[LinearSolver],
+                 factor_ndims: Sequence[int] | None = None):
         assert isinstance(V, StencilVectorSpace)
         assert isinstance(W, StencilVectorSpace)
         assert hasattr( solvers, '__iter__' )
         for solver in solvers:
             assert isinstance(solver, LinearSolver)
 
-        assert V.ndim == len(solvers)
-        assert W.ndim == len(solvers)
+        if factor_ndims is None:
+            factor_ndims = (1,) * len(solvers)
+        factor_ndims = tuple(int(n) for n in factor_ndims)
+        assert len(factor_ndims) == len(solvers), \
+            f'Got {len(solvers)} solvers but {len(factor_ndims)} factor_ndims.'
+        assert all(n >= 1 for n in factor_ndims)
+
+        assert V.ndim == sum(factor_ndims)
+        assert W.ndim == sum(factor_ndims)
         assert V.npts == W.npts
+
+        # axes of each factor
+        axes = []
+        d = 0
+        for n in factor_ndims:
+            axes.append(tuple(range(d, d + n)))
+            d += n
 
         # general arguments
         self._domain = V
         self._codomain = W
         self._solvers = solvers
+        self._factor_ndims = factor_ndims
+        self._axes = tuple(axes)
         self._parallel = self._domain.parallel
         self._dtype = self._codomain._dtype
         if self._parallel:
             self._mpi_type = self._domain._mpi_type
         else:
             self._mpi_type = None
-        self._ndim = self._codomain.ndim
+        # number of factors (= number of solve passes)
+        self._ndim = len(solvers)
 
         # compute and setup solver arguments
         self._setup_solvers()
@@ -454,9 +769,11 @@ class KroneckerLinearSolver(LinearOperator):
         ends = np.array(self._domain.ends) + 1
         self._slice = tuple([slice(s, e) for s,e in zip(starts, ends)])
 
-        # local and global sizes
-        nglobals = self._domain.npts
-        nlocals = ends - starts
+        # local and global sizes, per factor (axes of a factor are flattened into one)
+        npts = self._domain.npts
+        nlocals_axis = ends - starts
+        nglobals = [int(np.prod([npts[a] for a in grp])) for grp in self._axes]
+        nlocals = np.array([np.prod(nlocals_axis[list(grp)]) for grp in self._axes], dtype=int)
         self._localsize = np.prod(nlocals)
         mglobals = self._localsize // nlocals
         self._nlocals = nlocals
@@ -466,20 +783,25 @@ class KroneckerLinearSolver(LinearOperator):
 
         tempsize = self._localsize
         self._allserial = True
-        for i in range(self._ndim):
+        for i, grp in enumerate(self._axes):
             # decide for each direction individually, if we should
             # use a serial or a parallel/distributed solver
             # useful e.g. if we have little data in some directions
             # (and thus no data distributed there)
 
-            if not self._parallel or self._domain.cart.subcomm[i].size <= 1:
+            distributed = self._parallel and any(self._domain.cart.subcomm[a].size > 1 for a in grp)
+
+            if not distributed:
                 # serial solve
                 solver_passes[i] = KroneckerLinearSolver.KroneckerSolverSerialPass(
                         self._solvers[i], nglobals[i], mglobals[i])
+            elif len(grp) > 1:
+                raise NotImplementedError(f'The factor on axes {grp} is distributed across processes; '
+                                          'parallel solves are only implemented for 1d factors.')
             else:
                 # for the parallel case, use Alltoallv
                 solver_passes[i] = KroneckerLinearSolver.KroneckerSolverParallelPass(
-                        self._solvers[i], self._domain._mpi_type, i,
+                        self._solvers[i], self._domain._mpi_type, grp[0],
                         self._domain.cart, mglobals[i], nglobals[i], nlocals[i], self._localsize)
 
                 # we have a parallel solve pass now, so we are not completely local any more
@@ -529,37 +851,55 @@ class KroneckerLinearSolver(LinearOperator):
         return temp1, temp2
 
     @property
-    def domain(self):
+    def domain(self) -> StencilVectorSpace:
         return self._domain
     
     @property
-    def codomain(self):
+    def codomain(self) -> StencilVectorSpace:
         return self._codomain
     
     @property
     def dtype(self):
         return None
 
-    def transpose(self, conjugate=False):
+    @property
+    def factor_ndims(self) -> tuple[int, ...]:
+        """Number of axes of each factor."""
+        return self._factor_ndims
+
+    def transpose(self, conjugate: bool = False) -> KroneckerLinearSolver:
         new_domain = self._codomain
         new_codomain = self._domain
         new_solvers = [solver.transpose() for solver in self._solvers]
-        return KroneckerLinearSolver(new_domain, new_codomain, new_solvers)
+        return KroneckerLinearSolver(new_domain, new_codomain, new_solvers, factor_ndims=self._factor_ndims)
 
-    def dot(self, v, out=None):
+    def dot(self, v: StencilVector, out: StencilVector | None = None) -> StencilVector:
         return self.solve(v, out=out)
 
     @property
-    def solvers(self):
+    def solvers(self) -> tuple[LinearSolver, ...]:
         """
-        Returns an immutable view onto references to the one-dimensional solvers.
+        Returns an immutable view onto references to the solvers of the factors.
         """
         return tuple(self._solvers)
 
-    def solve(self, rhs, out=None):
+    def solve(self, rhs: StencilVector, out: StencilVector | None = None) -> StencilVector:
         """
         Solves Ax=b where A is a Kronecker product matrix (and represented as such),
         and b is a suitable vector.
+
+        Parameters
+        ----------
+        rhs : StencilVector
+            The right-hand side b, in the domain.
+
+        out : StencilVector, optional
+            Vector in the codomain, in which the solution is stored.
+
+        Returns
+        -------
+        StencilVector
+            The solution x (``out`` if given).
         """
 
         # type checks
@@ -643,7 +983,11 @@ class KroneckerLinearSolver(LinearOperator):
 
         # outslice[:] = sourceview.transpose(self._perm)
         perm = tuple(int(p) for p in self._perm)
-        outslice[:] = sourceview.transpose(perm)
+        if len(self._axes) == outslice.ndim:
+            outslice[:] = sourceview.transpose(perm)
+        else:
+            # factors with several axes: back from one axis per factor to all axes
+            outslice[:] = sourceview.transpose(perm).reshape(outslice.shape)
 
     class KroneckerSolverSerialPass:
         """
@@ -899,21 +1243,32 @@ class KroneckerLinearSolver(LinearOperator):
             self._comm.Alltoallv(targetargs, sourceargs)
 
 #==============================================================================
-def kronecker_solve(solvers, rhs, out=None):
+def kronecker_solve(solvers: Sequence[LinearSolver],
+                    rhs: StencilVector,
+                    out: StencilVector | None = None,
+                    factor_ndims: Sequence[int] | None = None) -> StencilVector:
     """
-    Solve linear system Ax=b with A=kron( A_n, A_{n-1}, ..., A_2, A_1 ), given
-    $n$ separate linear solvers $L_n$ for the 1D problems $A_n x_n = b_n$:
-
-    x_n = L_n.solve( b_n )
+    Solve the linear system Ax=b with A = kron(A_1, A_2, ..., A_m), given
+    one linear solver L_k per factor ($L_k$ solves $A_k x_k = b_k$).
 
     Parameters
     ----------
-    solvers : list( LinearSolver )
-        List of linear solvers along each direction: [L_1, L_2, ..., L_n].
+    solvers : sequence of LinearSolver
+        Solvers for the factors, ordered by axis: [L_1, L_2, ..., L_m].
 
     rhs : StencilVector
         Right hand side vector of linear system Ax=b.
 
+    out : StencilVector, optional
+        Vector in the space of rhs, in which the solution is stored.
+
+    factor_ndims : sequence of int, optional
+        Number of axes of each factor (see KroneckerLinearSolver). Defaults to 1 for every factor.
+
+    Returns
+    -------
+    StencilVector
+        The solution x (``out`` if given).
     """
     # all these feasability checks are again performed in the KroneckerLinearSolver class
     assert hasattr(solvers, '__iter__')
@@ -921,7 +1276,10 @@ def kronecker_solve(solvers, rhs, out=None):
         assert isinstance(solver, LinearSolver)
 
     assert isinstance(rhs, StencilVector)
-    assert rhs.space.ndim == len(solvers)
+    if factor_ndims is None:
+        assert rhs.space.ndim == len(solvers)
+    else:
+        assert rhs.space.ndim == sum(factor_ndims)
 
     if out is not None:
         assert isinstance(out, StencilVector)
@@ -929,5 +1287,5 @@ def kronecker_solve(solvers, rhs, out=None):
     else:
         out = StencilVector(rhs.space)
 
-    kronsolver = KroneckerLinearSolver(rhs.space, rhs.space, solvers)
+    kronsolver = KroneckerLinearSolver(rhs.space, rhs.space, solvers, factor_ndims=factor_ndims)
     return kronsolver.solve(rhs, out=out)
