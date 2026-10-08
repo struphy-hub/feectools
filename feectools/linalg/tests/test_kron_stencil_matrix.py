@@ -392,3 +392,79 @@ def test_multiplicants_deprecated():
     C = ComposedLinearOperator(W, W, A, A)
     with pytest.warns(DeprecationWarning):
         assert C.multiplicants == C.multiplicands == (A, A)
+
+
+#===============================================================================
+# KroneckerSumSolver (fast diagonalization)
+#===============================================================================
+from feectools.linalg.kron import KroneckerSumSolver
+
+
+def laplace_1d(n, periodic, seed):
+    """1d stiffness (random positive weights on a difference operator) and mass matrix."""
+    rng = np.random.default_rng(seed)
+    nd = n if periodic else n - 1
+    D = np.zeros((nd, n))
+    for r in range(nd):
+        D[r, r] = -1.
+        D[r, (r + 1) % n] = 1.
+    S = D.T @ np.diag(1. + rng.random(nd)) @ D
+    B = rng.random((n, n)) * (np.abs(np.subtract.outer(np.arange(n), np.arange(n))) <= 2)
+    M = B @ B.T + n * np.eye(n)
+    return S, M
+
+
+def check_sum_solver(comm, sigma, with_none):
+    npts, periods = [6, 7, 8], [True, False, True]
+    W = make_space(comm, npts, [2, 2, 3], periods)
+    S, M = zip(*(laplace_1d(n, P, seed=d) for d, (n, P) in enumerate(zip(npts, periods))))
+    S = list(S)
+    if with_none:
+        S[1] = None
+
+    def kron_term(d):
+        mats = [M[e] if e != d else S[d] for e in range(3)]
+        return reduce(np.kron, mats)
+
+    A = sum(kron_term(d) for d in range(3) if S[d] is not None) + sigma * reduce(np.kron, M)
+    solver = KroneckerSumSolver(W, S, M, sigma=sigma)
+
+    if sigma > 0:
+        b, bglob = random_vector(W, seed=4)
+        assert_local_equal(W, solver.dot(b), np.linalg.solve(A, bglob))
+    else:
+        # singular (constants of the periodic directions are in the kernel): pseudo-inverse,
+        # exact for right-hand sides in the range of A
+        bglob = A @ np.random.default_rng(5).random(A.shape[0])
+        b = StencilVector_from(W, bglob)
+        x = solver.dot(b)
+        assert_local_equal(W, StencilVector_from(W, A @ local_to_global(W, x)), bglob)
+    assert solver.transpose() is solver
+
+
+def local_to_global(W, x):
+    """Gather a distributed StencilVector into a global array (all processes)."""
+    glob = np.zeros(tuple(W.npts))
+    glob[local_slices(W)] = xp.to_numpy(x[local_slices(W)])
+    comm = W.cart.comm if W.parallel else None
+    if comm is not None:
+        glob = comm.allreduce(glob)
+    return glob.ravel()
+
+
+def StencilVector_from(W, glob):
+    v = StencilVector(W)
+    v[local_slices(W)] = xp.asarray(glob.reshape(tuple(W.npts))[local_slices(W)])
+    return v
+
+
+@pytest.mark.parametrize('sigma', [0.7, 0.])
+@pytest.mark.parametrize('with_none', [False, True])
+def test_kron_sum_solver_ser(sigma, with_none):
+    check_sum_solver(None, sigma, with_none)
+
+@pytest.mark.mpi
+@pytest.mark.parametrize('sigma', [0.7, 0.])
+@pytest.mark.parametrize('with_none', [False, True])
+def test_kron_sum_solver_par(sigma, with_none):
+    check_sum_solver(MPI.COMM_WORLD, sigma, with_none)

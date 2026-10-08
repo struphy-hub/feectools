@@ -17,6 +17,7 @@ from feectools.linalg.stencil import StencilVectorSpace, StencilVector, StencilM
 __all__ = ('KroneckerStencilMatrix',
            'ComposedKroneckerStencilMatrix',
            'KroneckerLinearSolver',
+           'KroneckerSumSolver',
            'KroneckerDenseMatrix',
            'kronecker_solve')
 
@@ -1297,6 +1298,169 @@ class KroneckerLinearSolver(LinearOperator):
             # blocked stripes -> parts of stripes
             synchronize_for_mpi(workmem, tempmem)
             self._comm.Alltoallv(targetargs, sourceargs)
+
+#==============================================================================
+class KroneckerSumSolver(LinearOperator):
+    r"""
+    Exact inverse of a sum of Kronecker products by fast diagonalization,
+
+    .. math::
+
+        A = \sum_{d=1}^n M_1 \otimes \dots \otimes M_{d-1} \otimes S_d \otimes M_{d+1} \otimes \dots \otimes M_n
+            + \sigma \, M_1 \otimes \dots \otimes M_n \,,
+
+    with symmetric 1d matrices $S_d$ and symmetric positive definite 1d matrices $M_d$
+    (e.g. stiffness and mass matrices of a Laplacian on a tensor-product grid).
+
+    In each direction, the generalized eigenproblem $S_d U_d = M_d U_d \Lambda_d$ is solved,
+    with $U_d^T M_d U_d = I$. Then $U^T A U = \Lambda$ with $U = U_1 \otimes \dots \otimes U_n$
+    and the diagonal $\Lambda = \Lambda_1 \oplus \dots \oplus \Lambda_n + \sigma$ (entries
+    $\lambda_{1,i_1} + \dots + \lambda_{n,i_n} + \sigma$), hence
+
+    .. math::
+
+        A^{-1} = U \, \Lambda^{-1} \, U^T \,.
+
+    The dense matrices $U_d^T$ and $U_d$ are applied with KroneckerLinearSolver (also along
+    distributed axes), $\Lambda^{-1}$ locally. Entries of $\Lambda$ that vanish (relative to its
+    largest entry, e.g. constants for a periodic Laplacian with $\sigma = 0$) are skipped, which
+    gives the pseudo-inverse.
+
+    Parameters
+    ----------
+    V : StencilVectorSpace
+        Domain and codomain.
+
+    stiffness : sequence of array | None
+        Dense global 1d matrices $S_d$ (shape ``(npts[d], npts[d])``); None for no term in direction d.
+
+    mass : sequence of array
+        Dense global 1d matrices $M_d$ (symmetric positive definite).
+
+    sigma : float
+        Coefficient of the mass term.
+
+    rtol : float
+        Entries of $\Lambda$ with ``|lambda| <= rtol * max|Lambda|`` are treated as zero (pseudo-inverse).
+    """
+
+    class _DenseApply(LinearSolver):
+        """'Solver' for KroneckerLinearSolver that applies a dense matrix to each right-hand side."""
+
+        def __init__(self, mat):
+            self._mat = mat
+
+        @property
+        def space(self):
+            return xp.ndarray
+
+        def transpose(self):
+            return KroneckerSumSolver._DenseApply(self._mat.T)
+
+        def solve(self, rhs, out=None):
+            # rows of rhs are the vectors: out_i = mat @ rhs_i
+            result = rhs @ self._mat.T
+            if out is None:
+                return result
+            out[...] = result
+            return out
+
+    def __init__(self,
+                 V: StencilVectorSpace,
+                 stiffness: Sequence,
+                 mass: Sequence,
+                 sigma: float = 0.0,
+                 rtol: float = 1e-12):
+
+        from scipy.linalg import eigh  # deferred: scipy.linalg is slow to import
+
+        assert isinstance(V, StencilVectorSpace)
+        assert len(stiffness) == len(mass) == V.ndim
+
+        U = []
+        lam = []
+        for d, (S, M) in enumerate(zip(stiffness, mass)):
+            M = np.asarray(xp.to_numpy(xp.asarray(M)), dtype=float)
+            assert M.shape == (V.npts[d], V.npts[d]), f'Mass matrix of direction {d} has shape {M.shape}.'
+            if S is None:
+                # U^T M U = I with eigenvalue 0
+                mu, Q = eigh(M)
+                assert mu.min() > 0, f'Mass matrix of direction {d} is not positive definite.'
+                U.append(Q / np.sqrt(mu))
+                lam.append(np.zeros(V.npts[d]))
+            else:
+                S = np.asarray(xp.to_numpy(xp.asarray(S)), dtype=float)
+                assert S.shape == M.shape, f'Stiffness matrix of direction {d} has shape {S.shape}.'
+                l_d, U_d = eigh(S, M)
+                U.append(U_d)
+                lam.append(l_d)
+
+        # eigenvalues of A on the rows owned by this process
+        local_lam = [l[s:e+1] for l, s, e in zip(lam, V.starts, V.ends)]
+        Lam = reduce(np.add.outer, local_lam) + sigma if V.ndim > 1 else local_lam[0] + sigma
+        Lam = np.asarray(Lam).reshape(tuple(e - s + 1 for s, e in zip(V.starts, V.ends)))
+
+        # pseudo-inverse: skip (numerically) vanishing eigenvalues
+        lam_max = max(abs(l).max() for l in lam) * V.ndim + abs(sigma)
+        inv_Lam = np.zeros_like(Lam)
+        nonzero = np.abs(Lam) > rtol * lam_max
+        inv_Lam[nonzero] = 1.0 / Lam[nonzero]
+
+        self._space = V
+        self._sigma = sigma
+        self._eigenvectors = tuple(U)
+        self._eigenvalues = tuple(lam)
+        self._inv_Lam = xp.asarray(inv_Lam)
+        self._UT = KroneckerLinearSolver(V, V, [KroneckerSumSolver._DenseApply(xp.asarray(u.T)) for u in U])
+        self._U = KroneckerLinearSolver(V, V, [KroneckerSumSolver._DenseApply(xp.asarray(u)) for u in U])
+        self._slice = tuple(slice(p*m, p*m + e - s + 1) for p, m, s, e in zip(V.pads, V.shifts, V.starts, V.ends))
+        self._tmp = V.zeros()
+
+    #--------------------------------------
+    # Abstract interface
+    #--------------------------------------
+    @property
+    def domain(self) -> StencilVectorSpace:
+        return self._space
+
+    @property
+    def codomain(self) -> StencilVectorSpace:
+        return self._space
+
+    @property
+    def dtype(self):
+        return self._space.dtype
+
+    @property
+    def eigenvalues(self) -> tuple:
+        r"""1d generalized eigenvalues $\Lambda_d$ of $(S_d, M_d)$ in each direction."""
+        return self._eigenvalues
+
+    @property
+    def eigenvectors(self) -> tuple:
+        """1d generalized eigenvectors $U_d$ (columns, $U_d^T M_d U_d = I$) in each direction."""
+        return self._eigenvectors
+
+    def transpose(self, conjugate: bool = False) -> KroneckerSumSolver:
+        """A is symmetric, so is its inverse."""
+        return self
+
+    def dot(self, v: StencilVector, out: StencilVector | None = None) -> StencilVector:
+        r"""Apply $A^{-1} = U \Lambda^{-1} U^T$ to ``v``."""
+        assert isinstance(v, StencilVector)
+        assert v.space is self._space
+        if out is not None:
+            assert isinstance(out, StencilVector)
+            assert out.space is self._space
+        else:
+            out = StencilVector(self._space)
+
+        tmp = self._UT.solve(v, out=self._tmp)
+        tmp._data[self._slice] *= self._inv_Lam
+        return self._U.solve(tmp, out=out)
+
+    def solve(self, rhs: StencilVector, out: StencilVector | None = None) -> StencilVector:
+        return self.dot(rhs, out=out)
 
 #==============================================================================
 def kronecker_solve(solvers: Sequence[LinearSolver],
