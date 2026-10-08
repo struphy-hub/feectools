@@ -10,12 +10,28 @@ import cunumpy as xp
 from feectools.ddm.cart import DomainDecomposition, CartDecomposition
 from feectools.linalg.stencil import StencilVectorSpace, StencilVector, StencilMatrix
 
-# (npts of the domain, npts of the codomain, pads): square matrices, and rectangular ones whose spaces
-# differ by one point in a direction, which makes `add` zero (or one) there, as for derivative operators.
+# (npts of the domain, npts of the codomain, pads of the spaces, pads of the matrix, periods): square matrices, and
+# rectangular ones whose spaces differ by one point in a direction, which makes `add` zero (or one) there, as for
+# derivative operators. A matrix whose pads are None has those of the spaces (2 * p + 1 diagonals), periods None
+# means periodic in every direction. The cases after the first three have fewer diagonals than 2 * p + 1 in some
+# direction (pads of the matrix smaller than those of the spaces) and/or non-periodic directions: blocks between
+# spaces of different degree per direction, and derivative-type (one-sided, offset) stencils.
 MATRIX_CASES = {
-    1: [((24,), (24,), (2,)), ((23,), (24,), (2,)), ((24,), (23,), (3,))],
-    2: [((10, 12), (10, 12), (2, 3)), ((11, 10), (12, 10), (2, 2)), ((12, 9), (11, 10), (1, 2))],
-    3: [((7, 8, 9), (7, 8, 9), (1, 2, 3)), ((8, 8, 9), (9, 8, 10), (1, 2, 2)), ((6, 5, 7), (5, 6, 7), (2, 1, 1))],
+    1: [((24,), (24,), (2,), None, None), ((23,), (24,), (2,), None, None), ((24,), (23,), (3,), None, None),
+        ((24,), (24,), (3,), (1,), (False,)), ((13,), (12,), (2,), (1,), (False,)), ((12,), (13,), (3,), (0,), (False,))],
+    2: [((10, 12), (10, 12), (2, 3), None, None), ((11, 10), (12, 10), (2, 2), None, None),
+        ((12, 9), (11, 10), (1, 2), None, None),
+        ((10, 9), (10, 9), (3, 2), (1, 2), (False, True)), ((9, 8), (8, 8), (2, 3), (2, 1), (False, False))],
+    3: [((7, 8, 9), (7, 8, 9), (1, 2, 3), None, None), ((8, 8, 9), (9, 8, 10), (1, 2, 2), None, None),
+        ((6, 5, 7), (5, 6, 7), (2, 1, 1), None, None),
+        # square, fewer diagonals in two directions (e.g. a mass matrix of a space of lower degree)
+        ((6, 7, 8), (6, 7, 8), (2, 3, 2), (1, 1, 2), (True, False, True)),
+        # rectangular between non-periodic spaces of different size per direction, all diagonals
+        ((8, 7, 9), (7, 7, 8), (2, 2, 3), None, (False, True, False)),
+        # derivative-type: rectangular, non-periodic, fewer diagonals in every direction
+        ((7, 8, 6), (8, 7, 6), (3, 2, 2), (1, 1, 1), (False, False, True)),
+        # one diagonal in two directions (pads 0), the codomain larger in both
+        ((7, 6, 5), (8, 6, 6), (1, 2, 1), (0, 2, 0), (False, True, False))],
 }
 
 # (npts, pads) of the vector spaces
@@ -26,10 +42,10 @@ VECTOR_CASES = {
 }
 
 
-def make_space(npts, pads, dtype=float):
-    """A serial StencilVectorSpace with periodic directions."""
+def make_space(npts, pads, dtype=float, periods=None):
+    """A serial StencilVectorSpace, periodic in every direction unless `periods` says otherwise."""
     ndim = len(npts)
-    D = DomainDecomposition(list(npts), periods=[True] * ndim)
+    D = DomainDecomposition(list(npts), periods=list(periods) if periods is not None else [True] * ndim)
     global_starts, global_ends = [], []
     for axis in range(ndim):
         ee = D.global_element_ends[axis].copy()
@@ -46,11 +62,11 @@ def random_like(array, rng):
     return xp.asarray(rng.random(shape).astype(array.dtype))
 
 
-def stencil_matrix(npts_domain, npts_codomain, pads, rng):
+def stencil_matrix(npts_domain, npts_codomain, pads, matrix_pads, periods, rng):
     """A StencilMatrix with random entries (spurious entries removed), its domain and its codomain."""
-    V = make_space(npts_domain, pads)
-    W = V if npts_domain == npts_codomain else make_space(npts_codomain, pads)
-    A = StencilMatrix(V, W)
+    V = make_space(npts_domain, pads, periods=periods)
+    W = V if npts_domain == npts_codomain else make_space(npts_codomain, pads, periods=periods)
+    A = StencilMatrix(V, W, pads=matrix_pads)
     A._data[...] = random_like(A._data, rng)
     A.remove_spurious_entries()
     return A, V, W
@@ -64,20 +80,21 @@ def stencil_vector(V, rng):
     return v
 
 
-def dot_arguments(npts_domain, npts_codomain, pads, seed):
+def dot_arguments(npts_domain, npts_codomain, pads, matrix_pads, periods, seed):
     """The arguments of ``stencil_dot_<n>d`` as ``StencilMatrix.dot`` passes them."""
     rng = np.random.default_rng(seed)
-    A, V, W = stencil_matrix(npts_domain, npts_codomain, pads, rng)
+    A, V, W = stencil_matrix(npts_domain, npts_codomain, pads, matrix_pads, periods, rng)
     v = stencil_vector(V, rng)
     out = StencilVector(W)
     return (A._data, v._data, out._data, *A._args.values())
 
 
-def transpose_arguments(npts_domain, npts_codomain, pads, seed):
+def transpose_arguments(npts_domain, npts_codomain, pads, matrix_pads, periods, seed):
     """The arguments of ``stencil_transpose_<n>d`` as ``StencilMatrix.transpose`` passes them."""
     rng = np.random.default_rng(seed)
-    A, V, W = stencil_matrix(npts_domain, npts_codomain, pads, rng)
-    out = StencilMatrix(W, V)
+    A, V, W = stencil_matrix(npts_domain, npts_codomain, pads, matrix_pads, periods, rng)
+    A.update_ghost_regions()
+    out = StencilMatrix(W, V, pads=matrix_pads)
     return (A._data, out._data, *A._transpose_args.values())
 
 

@@ -1131,7 +1131,7 @@ class StencilMatrix(LinearOperator):
         if not v.ghost_regions_in_sync:
             v.update_ghost_regions()
 
-        self._check_kernel_shapes()
+        self._check_kernel_shifts()
 
         # zeros, not empty: the kernel only writes the interior (non-padding)
         # region, so the padding must be initialized to avoid leaking stale
@@ -1145,18 +1145,18 @@ class StencilMatrix(LinearOperator):
         return out
 
     # ...
-    def _check_kernel_shapes(self, *others):
+    def _check_kernel_shifts(self, *others):
         """
-        Raise if the precompiled dot/transpose kernels cannot be used with the
-        data of this matrix (or of `others`), see `set_backend`.
+        Raise if the stencil kernels cannot be used with the data of this
+        matrix (or of `others`): they handle any number of diagonals (pads of
+        the matrix up to those of the spaces) and rectangular matrices, but
+        only spaces without shifts (shifts == 1), see `set_backend`.
         """
         for M in (self, *others):
-            if not M._kernel_shapes_ok:
+            if not M._kernel_shifts_ok:
                 raise NotImplementedError(
-                    'The precompiled stencil kernels need a matrix without shifts and with '
-                    '2 * p + 1 diagonals per direction (p: the pads of the domain), '
-                    f'got data of shape {M._data_shape} for the pads {M.domain.pads}, '
-                    f'domain shifts {M.domain.shifts} and codomain shifts {M.codomain.shifts}.')
+                    'The stencil kernels need spaces without shifts (shifts == 1), '
+                    f'got domain shifts {M.domain.shifts} and codomain shifts {M.codomain.shifts}.')
 
     # ...
     def vdot( self, v, out=None):
@@ -1191,7 +1191,7 @@ class StencilMatrix(LinearOperator):
         if not v.ghost_regions_in_sync:
             v.update_ghost_regions()
 
-        self._check_kernel_shapes()
+        self._check_kernel_shifts()
 
         # Instead of computing A_*x, this function computes (A*x_)_
         # zeros, not empty: see comment in dot() above.
@@ -1228,11 +1228,13 @@ class StencilMatrix(LinearOperator):
             assert isinstance(out, StencilMatrix)
             assert out.codomain == M.domain
             assert out.domain == M.codomain
-            
+            # the kernels map diagonal d of `out` to diagonal 2 q - d of M (q: the pads of the matrices)
+            assert tuple(out._pads) == tuple(M._pads)
+
         else :
             out = StencilMatrix(M.codomain, M.domain, pads=self._pads, backend=self._backend, precompiled=self._precompiled)
 
-        M._check_kernel_shapes(out)
+        M._check_kernel_shifts(out)
 
         # Call low-level '_transpose' function: the kernel of the active backend
         # (a cunumpy Kernel, see set_backend)
@@ -1993,7 +1995,7 @@ class StencilMatrix(LinearOperator):
         self._args    = self._dotargs_null.copy()
         # The kernels are called with the values of self._args (and of
         # self._transpose_args) as positional arguments, in this order.
-        self._kernel_shapes_ok = True
+        self._kernel_shifts_ok = True
 
         if self._backend is None:
             for key, arg in self._args.items():
@@ -2005,13 +2007,13 @@ class StencilMatrix(LinearOperator):
                           ('starts', 'nrows', 'nrows_extra', 'dm', 'cm', 'pad_imp', 'ndiags', 'gpads')}
         elif precompiled:
 
-            # The precompiled kernels read the diagonals 0 <= d < 2 * p + 1 of the
-            # matrix data and its rows at p + i_loc (no shifts); the CUDA versions
-            # take the shape of 3D matrix data (6 axes, a raw pointer) from that.
+            # The precompiled kernels take the number of diagonals of each
+            # direction from the shape of the matrix data (pads of the matrix up
+            # to those of the spaces), but assume spaces without shifts: their
+            # rows start at index p of the data and diagonal d of row i is the
+            # column i - q + d. Shifts > 1 raise in dot, vdot and transpose.
             shifts = (*self.domain.shifts, *self.codomain.shifts)
-            diags  = tuple(2 * int(p) + 1 for p in self.domain.pads)
-            self._kernel_shapes_ok = (all(int(m) == 1 for m in shifts)
-                                      and tuple(self._data_shape[self._ndim:]) == diags)
+            self._kernel_shifts_ok = all(int(m) == 1 for m in shifts)
 
             # matvec kernel: stencil_dot_<n>d, pyccel or CUDA by backend
             self._func = stencil_kernels['dot'][self._ndim]
@@ -2044,7 +2046,6 @@ class StencilMatrix(LinearOperator):
             self._transpose_args = {}
             if self._ndim == 1:
                 self._transpose_args['s_in'] = int(self.codomain.starts[0])
-                self._transpose_args['e_in'] = int(self.codomain.ends[0])
                 self._transpose_args['p_in'] = int(self.codomain.pads[0])
                 self._transpose_args['add'] = int(add[0])
                 self._transpose_args['s_out'] = int(self.domain.starts[0])
@@ -2052,7 +2053,6 @@ class StencilMatrix(LinearOperator):
                 self._transpose_args['p_out'] = int(self.domain.pads[0])
             else:
                 self._transpose_args['s_in'] = xp.array(self.codomain.starts)
-                self._transpose_args['e_in'] = xp.array(self.codomain.ends)
                 self._transpose_args['p_in'] = xp.array(self.codomain.pads)
                 self._transpose_args['add'] = xp.array(add)
                 self._transpose_args['s_out'] = xp.array(self.domain.starts)
