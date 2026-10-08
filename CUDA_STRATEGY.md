@@ -48,7 +48,7 @@ come from
 - **No silent CPU fallback** for folder kernels: on the CuPy backend a folder kernel without CUDA version raises.
   The other pyccel kernels (B-splines, field evaluation, DOF kernels, used at setup) are wrapped in
   `cunumpy.kernels.PyccelKernel` and copy their arrays to the host and back; see [Open questions](#open-questions).
-- **Same cunumpy as struphy.** `cunumpy >= 0.5.0, < 0.6`; names are imported from the submodules
+- **Same cunumpy as struphy.** `cunumpy >= 0.6.1` (the 3D stencil kernels need its 6D array views); names are imported from the submodules
   (`cunumpy.kernels`, `cunumpy.arguments`, `cunumpy.cuda`, `cunumpy.mpi`, `cunumpy.kernel_testing`); cunumpy 0.6 removed
   the old top-level names, and `CudaKernel`/`CudaKernelVariants` are in `cunumpy.kernels` since 0.6.
 - **Small steps.** Every PR keeps the NumPy path working and tested.
@@ -61,7 +61,8 @@ feectools works when cunumpy's backend is CuPy, without device kernels:
   `cunumpy.kernels.PyccelKernel`, so they accept CuPy arrays (copied to the host and back).
 - Host-only metadata stays on NumPy: MPI and index bookkeeping in `ddm` and `fem.partitioning`, Kronecker solver
   sizes, index arithmetic with Python ints.
-- Host-only libraries (LAPACK/SuperLU, SciPy FFT, SciPy sparse) get host copies per array, not by global backend.
+- Host-only libraries (LAPACK/SuperLU, SciPy FFT, SciPy sparse) get host copies per array, not by global backend
+  (the Kronecker solver no longer does, see [Kronecker solver on the device](#kronecker-solver-on-the-device-96)).
 - The 1D collocation matrices of the global projectors are built vectorized (element-wise indexing was one device
   round trip per entry: 334 s of a 348 s Derham setup on the GPU).
 - Bug fix on both backends: `StencilMatrix._update_ghost_regions_serial` uses a ghost region `pads * shifts` wide.
@@ -116,16 +117,11 @@ CuPy. There are no backend branches and no host staging at these call sites any 
   of generated source is gone.
 - **Signature changes.** The inner kernels add their result to an argument `res` (`res[0] += ...`, the caller
   zeroes it; `inner` passes the MPI send buffer) instead of returning it, because a CUDA kernel cannot return a
-  value; on the GPU each block reduces in shared memory and adds its sum with one `atomicAdd`. The transpose
-  kernels take `e_in` (end of the row range of `mat`) after `s_in`; pyccel does not need it, the 3D CUDA kernel
-  needs it for the shape of `mat`.
-- **6D matrix data.** cunumpy's array views stop at `Array4D`, so the 3D kernels take the six-axis matrix data as
-  raw pointers (C-contiguity checked by `CudaKernel`) and derive their shape from the other arguments: rows from
-  `out` (dot) or from `s/e/p` (transpose), and `2 * p + 1` diagonals. This is exactly what the precompiled pyccel
-  kernels read, and they are wrong for other data too, so `StencilMatrix.set_backend` records whether the matrix
-  has no shifts and `2 * p + 1` diagonals (`_kernel_shapes_ok`), and `dot`, `vdot` and `transpose` raise
-  `NotImplementedError` otherwise, on both backends (no test or call site in the test suite builds such a matrix
-  for these kernels). Array views up to 6D in cunumpy would remove this restriction (see [Open questions](#open-questions)).
+  value; on the GPU each block reduces in shared memory and adds its sum with one `atomicAdd`. (The transpose
+  kernels had an argument `e_in` for the shape of the 3D matrix data; it is gone, see the 6D views below.)
+- **6D matrix data:** see [6D matrix views](#6d-matrix-views-stencil-6d-views). (In #88 the 3D kernels took the
+  six-axis data as raw pointers and assumed `2 * p + 1` diagonals; `dot`, `vdot` and `transpose` raised for other
+  matrices.)
 - **Launch sizes** are declared in each folder's `__init__.py` (`n_threads_from`): one thread per entry of `out`,
   `matT`, `v1` or `x`, the last axis varying fastest; threads outside the owned rows or diagonals return without
   writing, as the pyccel loops do. The inner kernels use blocks of 256 threads.
@@ -133,6 +129,70 @@ CuPy. There are no backend branches and no host staging at these call sites any 
   `inner` 0.02 ms, `axpy` 0.013 ms before and after).
 - `psydac-accelerate` compiles every `*_kernels.py`, so the new folders are compiled like the old modules; `.cu`
   files are shipped as package data.
+
+## Kronecker solver on the device (#96)
+
+[#96](https://github.com/struphy-hub/feectools/pull/96): `KroneckerLinearSolver` solves device data on the device. Before, its 1D solvers (`BandedSolver`, LAPACK
+`?gbtrs`; `SparseSolver`, SuperLU) copied the data of every direction to the host and back in every solve, i.e. in
+every CG iteration preconditioned by struphy's `MassMatrixPreconditioner` (struphy-hub/struphy#650, #689).
+
+- **Dense inverses of the 1D matrices.** `direct_solvers.DenseInverse` inverts a 1D matrix once on the host, with
+  the solver itself (`M = solver.solve(I)`, so pivoting, transposition and the solver's own quirks are those of
+  the host path), and applies it as `rhs @ M`: one GEMM (cuBLAS) over all right-hand sides of a pass. The 1D
+  matrices are small (n ~ tens to hundreds), clamped (banded) or periodic (with corners, so banded storage has
+  full bandwidth anyway), and an n x n GEMM over m right-hand sides is a better fit for a GPU than m banded
+  triangular solves. `cupyx.scipy.linalg` offers dense `lu_factor`/`lu_solve` but, to our knowledge, no
+  `solve_banded`; `lu_solve` would need the dense matrix too and run two triangular solves instead of one GEMM.
+- **Any linear 1D solver.** The Kronecker passes build the inverse from `solver.solve` on host arrays, so
+  struphy's `FFTSolver` (circulant mass matrices, `scipy.linalg.solve_circulant`) works without changes. A 1D
+  solver that must not be replaced by its dense matrix sets `dense_on_device = False`: the FFT "solvers" of
+  `linalg/fft.py` do (an FFT is O(n log n)); they still stage through the host.
+- **Decided by the array**, as before: `KroneckerSolverSerialPass.solve_pass` (also used inside the distributed
+  pass, between the two `Alltoallv`) and `BandedSolver`/`SparseSolver.solve` use the dense inverse for
+  `xp.is_gpu(array)` and LAPACK/SuperLU otherwise. The host path is unchanged.
+- **Copied to the device once, at setup.** A `KroneckerLinearSolver` whose temporaries are on the device (CuPy
+  backend) builds the inverses and copies them to the device in its constructor (and in `transpose()`, which
+  builds a new solver), so `solve` makes no transfer. A standalone `BandedSolver`/`SparseSolver` called with
+  device arrays copies its inverse on the first device solve (one `to_device`), cached per dtype.
+- **Accuracy.** Inverse-times-vector and LU solve are both backward stable; for the well-conditioned mass
+  matrices the results agree to round-off (tests use 1e-12 relative to the solution).
+- **Tests** (`linalg/tests/test_kron_device_solve.py`): `DenseInverse` against the host solvers (banded and
+  sparse, clamped and periodic, transposed, real and complex) and the Kronecker solve against a global
+  reference, serial and with MPI, on the CPU; the device path with cunumpy's fake CuPy in a serial subprocess
+  (clean environment, `MAYBEMPI=0`), including `assert_no_transfers` around `solve`; on a GPU (`requires_cupy`)
+  device against host solves under `assert_no_transfers`, serial and with MPI. Before this change a 3D solve on
+  the fake CuPy made 3 `to_host` copies (one per direction) and 3 uncounted copies back.
+
+## 6D matrix views (`stencil-6d-views`)
+
+With cunumpy 0.6.1 (`Array5D`/`Array6D`, `CArray5D`/`CArray6D` in `cunumpy/array_view.cuh`) the 3D kernels take
+the matrix data as views, like the 1D/2D kernels (`Array2D`/`Array4D`):
+
+- `stencil_dot_3d(Array6D<double> mat, Array3D<double> x, Array3D<double> out, s_in, p_in, add, s_out, e_out,
+  p_out)` and `stencil_transpose_3d(Array6D<double> mat, Array6D<double> matT, s_in, p_in, add, s_out, e_out,
+  p_out)`; the pyccel versions take `float[:, :, :, :, :, :]` with the same arguments in the same order. Strided
+  views (`Array6D`, not `CArray6D`), as in 1D/2D, so a non-contiguous matrix is not refused.
+- **No `e_in`.** The transpose kernels (all dimensions, the argument list is the same for all) lost `e_in`: it was
+  only needed for the row extents of the raw pointer in 3D.
+- **The number of diagonals comes from the data.** All six kernels (1D, 2D, 3D, pyccel and CUDA) read the number
+  of diagonals `n_k` of each direction from the shape of the matrix data instead of assuming `2 * p_in + 1`: the
+  pads of the matrix are `q_k = (n_k - 1) // 2` (at most the pads of the spaces, `StencilMatrix(V, W, pads=...)`),
+  diagonal `d` of row `i` is the column `i - q + d` (in `x` at `i - q + d - s_in + p_in`), and the last owned row
+  uses `n_k - 1 + add[k]` diagonals. With `q = p` this is the old loop, in the same order and with bitwise the same
+  results (checked against the kernels of #88 run as Python); the pyccel kernels are now one loop nest with the
+  number of diagonals picked per row instead of the eight (3D) spelled-out combinations.
+- **`StencilMatrix`.** `dot`, `vdot` and `transpose` no longer raise for matrices with fewer diagonals (blocks
+  between spaces of different degree, derivative-type stencils); `transpose(out=...)` asserts that `out` has the
+  pads of the matrix. The one restriction left is spaces with **shifts > 1**, which still raise
+  `NotImplementedError` (`_check_kernel_shifts`): the stencil kernels have never handled them, and there is no
+  reference to match, since the general psydac kernels (`matvec_<n>d`, `transpose_<n>d`) disagree with `toarray()`
+  and with each other (the transpose is not the adjoint of the product) for shifts > 1, and psydac never tested
+  them ("TODO: verify for s>1").
+- **Tests.** `MATRIX_CASES` (parity and CPU emulation) has matrices with fewer diagonals and non-periodic
+  rectangular blocks between spaces of different size per direction, including pads 0 (one diagonal);
+  `test_device_matvec.py` compares `dot`, `vdot` and `transpose` of such matrices with dense `toarray()`
+  references, and `test_mpi_device.py` checks a matrix with fewer diagonals and the adjoint identity of its
+  transpose against the global field on any number of ranks.
 
 ## Kernel folders
 
@@ -174,20 +234,56 @@ Conventions, as in struphy:
 - GPU tests are skipped without CuPy and a GPU (`cunumpy.kernel_testing.requires_cupy`). Until a GPU runner exists,
   they are run by hand on an H100 before a PR that touches CUDA code is merged, and the PR description says so.
 
+## Inner products on the device
+
+`StencilVectorSpace.inner` (and so `StencilVector.inner`, `BlockVectorSpace.inner`, `dot_inner`) returns a 0-d
+CuPy array for device data, in the serial and the MPI case (the `Allreduce` works on the device buffers, after
+`synchronize_for_mpi`); before, the serial case copied the 8-byte result to the host. The result is a copy of the
+reduction buffer, which the next inner product with the same vector overwrites. On NumPy it is a NumPy scalar, as
+before.
+
+- `StencilVectorSpace.axpy` with a 0-d device array computes `y += a * x` with array operations (the axpy kernel
+  takes `alpha` by value, so calling it would copy `a` to the host and wait for the device).
+- CG, PCG, BiCG, BiCGStab and PBiCGStab keep their step sizes on the device; the only copy per iteration is the
+  residual norm of the convergence test (`solvers._host`). BiCGStab tested the residual twice per iteration (once
+  redundantly); it now tests it once. MINRES, LSMR and the Uzawa solver do their scalar recurrences on the host
+  and copy every inner product, as before; GMRES keeps its Arnoldi inner products on the device.
+- Copies to the host per iteration, counted under the fake CuPy (`linalg/tests/test_inner_on_device.py`, which
+  also counts implicit conversions such as `float()`, invisible to `count_transfers`):
+
+  | Solver | before | after |
+  | --- | --- | --- |
+  | CG | 2 | 1 |
+  | PCG | 3 | 1 |
+  | BiCG | 4 | 1 |
+  | BiCGStab | 6 | 1 |
+  | PBiCGStab | 5 | 1 |
+  | MINRES, LSMR | 3 | 3 |
+
+  Iteration counts and solutions are identical to NumPy.
+
 ## Open questions
 
 - **Setup kernels on the GPU.** B-spline, field evaluation and DOF kernels still run on the host through
   `PyccelKernel` (host copies). They run at setup, not in the time loop; they move into kernel folders with CUDA
   versions when a profile shows they matter.
 - **GPU CI.** No GPU runner yet; GPU tests are run by hand.
-- **6D array views in cunumpy.** With `Array5D`/`Array6D` (also needed by struphy's matrix accumulations), the 3D
-  kernels could take the matrix data as views, drop the shape assumptions and the `e_in` argument.
+- **Shifts > 1.** `StencilMatrix.dot`/`transpose` raise for spaces with shifts > 1 (see
+  [6D matrix views](#6d-matrix-views-stencil-6d-views)); supporting them needs a verified definition of the data
+  layout first.
 - **Complex data on the device.** Not needed by struphy so far; would need a second CUDA kernel per folder (or
   dtype dispatch in `cunumpy.kernels.Kernel`).
-- **`inner` reduction.** One `atomicAdd` per block of 256 threads, then a copy of the 8-byte result to the host in
-  the serial case (in the parallel case it goes into the MPI reduction). To be measured on the H100.
+- **`inner` reduction.** One `atomicAdd` per block of 256 threads; the result stays on the device (see
+  [Inner products on the device](#inner-products-on-the-device)). To be measured on the H100.
+- **Fewer convergence tests.** The Krylov solvers still copy the residual norm to the host once per iteration.
+  Testing it every k iterations would remove most of these synchronizations, at the cost of up to k - 1 extra
+  iterations (which must not divide by a zero residual) and of iteration counts that differ from NumPy.
 - **Interface matrices** (`StencilInterfaceMatrix`) and the remaining stencil kernels (`stencil2coo`, ...) still use
   `PyccelKernel` with host copies.
+- **FFT on the device.** `DistributedFFT` and friends still stage their data through the host (SciPy FFT); they
+  could use `cupyx.scipy.fft` for device data.
+- **Large 1D matrices.** The dense inverse costs n^2 memory and O(m n^2) per pass. Fine for the mass matrices of
+  struphy's preconditioners; for 1D sizes in the thousands a batched banded solve on the device would be cheaper.
 
 ## MPI through maybempi
 

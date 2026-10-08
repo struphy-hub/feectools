@@ -13,6 +13,7 @@ from scipy.sparse import coo_matrix
 from feectools.ddm.cart       import CartDecomposition
 from feectools.linalg.basic   import ComposedLinearOperator, LinearOperator, LinearSolver
 from feectools.linalg.stencil import StencilVectorSpace, StencilVector, StencilMatrix
+from feectools.linalg.direct_solvers import DenseInverse
 
 __all__ = ('KroneckerStencilMatrix',
            'ComposedKroneckerStencilMatrix',
@@ -833,6 +834,13 @@ class KroneckerLinearSolver(LinearOperator):
 
         # for now: allocate temporary arrays here (can be removed later)
         self._temp1, self._temp2 = self._allocate_temps()
+
+        # Temporaries on the device (CuPy backend): the 1D solves will run on the
+        # device, so build their dense inverses and copy them to the device now,
+        # not inside the first solve (see KroneckerSolverSerialPass).
+        if xp.is_gpu(self._temp1):
+            for solver_pass in self._solver_passes:
+                solver_pass.prepare_device(self._dtype)
     
     def _setup_solvers(self):
         """
@@ -1093,6 +1101,32 @@ class KroneckerLinearSolver(LinearOperator):
             self._datasize = nglobal*mglobal
             self._solver = solver
             self._view = None
+            # dense inverses for device solves, per dtype (see DenseInverse)
+            self._dense_inverses = {}
+
+        def uses_dense_inverse(self):
+            """
+            Whether device data is solved with the dense inverse of the 1D solver.
+
+            True for every 1D solver unless it sets ``dense_on_device = False``
+            (as the FFT "solvers" of `feectools.linalg.fft` do; their dense matrix
+            would replace an O(n log n) transform by an O(n^2) product).
+            """
+            return getattr(self._solver, 'dense_on_device', True)
+
+        def dense_inverse(self, dtype):
+            """The `DenseInverse` of the 1D solver for right-hand sides of type ``dtype``, built once."""
+            key = np.dtype(dtype)
+            inverse = self._dense_inverses.get(key)
+            if inverse is None:
+                inverse = DenseInverse(self._solver, self._dimrhs, key)
+                self._dense_inverses[key] = inverse
+            return inverse
+
+        def prepare_device(self, dtype):
+            """Builds the dense inverse and copies it to the device ahead of the first device solve."""
+            if self.uses_dense_inverse():
+                self.dense_inverse(dtype).device_matrix()
         
         def required_memory(self):
             """
@@ -1117,6 +1151,13 @@ class KroneckerLinearSolver(LinearOperator):
             # reshape necessary memory in column-major
             view = workmem[:self._datasize]
             view.shape = (int(self._numrhs), int(self._dimrhs))
+
+            # LAPACK/SuperLU (and the solvers of other libraries) are host-only:
+            # device data is solved with the precomputed dense inverse, one matrix
+            # product on the device without host copies. Decided by the array.
+            if xp.is_gpu(view) and self.uses_dense_inverse():
+                self.dense_inverse(view.dtype).solve(view, out=view)
+                return
 
             # call solver in in-place mode
             self._solver.solve(view, out=view)
@@ -1259,6 +1300,10 @@ class KroneckerLinearSolver(LinearOperator):
             Returns the required memory for this operation. Minimum size for the workmem and tempmem parameters.
             """
             return max(self._datasize, self._localsize)
+
+        def prepare_device(self, dtype):
+            """See `KroneckerSolverSerialPass.prepare_device`."""
+            self._serialsolver.prepare_device(dtype)
 
         def _blocked_to_contiguous(self, blocked, contiguous):
             """

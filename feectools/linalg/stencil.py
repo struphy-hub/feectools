@@ -300,9 +300,12 @@ class StencilVectorSpace(VectorSpace):
 
         Returns
         -------
-        float | complex
+        float | complex | cupy.ndarray
             The scalar product of the two vectors. Note that inner(x, x) is
             a non-negative real number which is zero if and only if x = 0.
+            A NumPy scalar for NumPy data; for device (CuPy) data a 0-d
+            device array, so that the result stays on the device (no copy
+            to the host, no synchronization).
 
         """
 
@@ -324,10 +327,14 @@ class StencilVectorSpace(VectorSpace):
             self.cart.global_comm.Allreduce((x._dot_send_data, self.mpi_type),
                                             (x._dot_recv_data, self.mpi_type),
                                              op=MPI.SUM )
-            return x._dot_recv_data[0]
-        else:
-            # a NumPy scalar on both backends
-            return xp.to_numpy(res)[0]
+            res = x._dot_recv_data
+
+        if xp.is_gpu(res):
+            # A 0-d device array. Copied (on the device), because res is a buffer
+            # of x that the next inner product with x overwrites.
+            return res[0].copy()
+        # a NumPy scalar
+        return res[0]
 
     # ...
     def axpy(self, a, x, y):
@@ -339,7 +346,9 @@ class StencilVectorSpace(VectorSpace):
         Parameters
         ----------
         a : scalar
-            The scaling coefficient needed for the operation.
+            The scaling coefficient needed for the operation. A Python or
+            NumPy scalar, or a 0-d device array (e.g. the result of `inner`
+            on device data), which is not copied to the host.
 
         x : StencilVector
             The vector which is not modified by this function.
@@ -351,6 +360,18 @@ class StencilVectorSpace(VectorSpace):
         assert isinstance(y, StencilVector)
         assert x._space is self
         assert y._space is self
+
+        if xp.is_gpu(a):
+            # A device scalar, e.g. the result of an inner product: converting it
+            # to a Python scalar for the kernel would copy it to the host and wait
+            # for the device, so y += a * x is computed with array operations.
+            if self.dtype != complex and xp.iscomplexobj(a):
+                raise TypeError('A complex scalar was given in a real case')
+            y._data += a * x._data
+            for axis, ext in self.interfaces:
+                y._interface_data[axis, ext] += a * x._interface_data[axis, ext]
+            y._sync = x._sync and y._sync
+            return
 
         if self.dtype == complex:
             a = complex(a)
@@ -1131,7 +1152,7 @@ class StencilMatrix(LinearOperator):
         if not v.ghost_regions_in_sync:
             v.update_ghost_regions()
 
-        self._check_kernel_shapes()
+        self._check_kernel_shifts()
 
         # zeros, not empty: the kernel only writes the interior (non-padding)
         # region, so the padding must be initialized to avoid leaking stale
@@ -1145,18 +1166,18 @@ class StencilMatrix(LinearOperator):
         return out
 
     # ...
-    def _check_kernel_shapes(self, *others):
+    def _check_kernel_shifts(self, *others):
         """
-        Raise if the precompiled dot/transpose kernels cannot be used with the
-        data of this matrix (or of `others`), see `set_backend`.
+        Raise if the stencil kernels cannot be used with the data of this
+        matrix (or of `others`): they handle any number of diagonals (pads of
+        the matrix up to those of the spaces) and rectangular matrices, but
+        only spaces without shifts (shifts == 1), see `set_backend`.
         """
         for M in (self, *others):
-            if not M._kernel_shapes_ok:
+            if not M._kernel_shifts_ok:
                 raise NotImplementedError(
-                    'The precompiled stencil kernels need a matrix without shifts and with '
-                    '2 * p + 1 diagonals per direction (p: the pads of the domain), '
-                    f'got data of shape {M._data_shape} for the pads {M.domain.pads}, '
-                    f'domain shifts {M.domain.shifts} and codomain shifts {M.codomain.shifts}.')
+                    'The stencil kernels need spaces without shifts (shifts == 1), '
+                    f'got domain shifts {M.domain.shifts} and codomain shifts {M.codomain.shifts}.')
 
     # ...
     def vdot( self, v, out=None):
@@ -1191,7 +1212,7 @@ class StencilMatrix(LinearOperator):
         if not v.ghost_regions_in_sync:
             v.update_ghost_regions()
 
-        self._check_kernel_shapes()
+        self._check_kernel_shifts()
 
         # Instead of computing A_*x, this function computes (A*x_)_
         # zeros, not empty: see comment in dot() above.
@@ -1228,11 +1249,13 @@ class StencilMatrix(LinearOperator):
             assert isinstance(out, StencilMatrix)
             assert out.codomain == M.domain
             assert out.domain == M.codomain
-            
+            # the kernels map diagonal d of `out` to diagonal 2 q - d of M (q: the pads of the matrices)
+            assert tuple(out._pads) == tuple(M._pads)
+
         else :
             out = StencilMatrix(M.codomain, M.domain, pads=self._pads, backend=self._backend, precompiled=self._precompiled)
 
-        M._check_kernel_shapes(out)
+        M._check_kernel_shifts(out)
 
         # Call low-level '_transpose' function: the kernel of the active backend
         # (a cunumpy Kernel, see set_backend)
@@ -1993,7 +2016,7 @@ class StencilMatrix(LinearOperator):
         self._args    = self._dotargs_null.copy()
         # The kernels are called with the values of self._args (and of
         # self._transpose_args) as positional arguments, in this order.
-        self._kernel_shapes_ok = True
+        self._kernel_shifts_ok = True
 
         if self._backend is None:
             for key, arg in self._args.items():
@@ -2005,13 +2028,13 @@ class StencilMatrix(LinearOperator):
                           ('starts', 'nrows', 'nrows_extra', 'dm', 'cm', 'pad_imp', 'ndiags', 'gpads')}
         elif precompiled:
 
-            # The precompiled kernels read the diagonals 0 <= d < 2 * p + 1 of the
-            # matrix data and its rows at p + i_loc (no shifts); the CUDA versions
-            # take the shape of 3D matrix data (6 axes, a raw pointer) from that.
+            # The precompiled kernels take the number of diagonals of each
+            # direction from the shape of the matrix data (pads of the matrix up
+            # to those of the spaces), but assume spaces without shifts: their
+            # rows start at index p of the data and diagonal d of row i is the
+            # column i - q + d. Shifts > 1 raise in dot, vdot and transpose.
             shifts = (*self.domain.shifts, *self.codomain.shifts)
-            diags  = tuple(2 * int(p) + 1 for p in self.domain.pads)
-            self._kernel_shapes_ok = (all(int(m) == 1 for m in shifts)
-                                      and tuple(self._data_shape[self._ndim:]) == diags)
+            self._kernel_shifts_ok = all(int(m) == 1 for m in shifts)
 
             # matvec kernel: stencil_dot_<n>d, pyccel or CUDA by backend
             self._func = stencil_kernels['dot'][self._ndim]
@@ -2044,7 +2067,6 @@ class StencilMatrix(LinearOperator):
             self._transpose_args = {}
             if self._ndim == 1:
                 self._transpose_args['s_in'] = int(self.codomain.starts[0])
-                self._transpose_args['e_in'] = int(self.codomain.ends[0])
                 self._transpose_args['p_in'] = int(self.codomain.pads[0])
                 self._transpose_args['add'] = int(add[0])
                 self._transpose_args['s_out'] = int(self.domain.starts[0])
@@ -2052,7 +2074,6 @@ class StencilMatrix(LinearOperator):
                 self._transpose_args['p_out'] = int(self.domain.pads[0])
             else:
                 self._transpose_args['s_in'] = xp.array(self.codomain.starts)
-                self._transpose_args['e_in'] = xp.array(self.codomain.ends)
                 self._transpose_args['p_in'] = xp.array(self.codomain.pads)
                 self._transpose_args['add'] = xp.array(add)
                 self._transpose_args['s_out'] = xp.array(self.domain.starts)

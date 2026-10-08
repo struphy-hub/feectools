@@ -7,15 +7,16 @@
  *
  * One thread per entry of `out` (n_threads = out.size, see __init__.py). A thread outside the owned rows
  * (local row index i1_loc outside [0, e_out - s_out]) returns without writing, so the padding of `out` is
- * left as it is, as in pyccel. Interior rows use 2 * p_in + 1 diagonals, the last owned row (i1 == e_out)
- * uses 2 * p_in + add, which is how a rectangular matrix is handled.
+ * left as it is, as in pyccel. The matrix has n = mat.shape[1] diagonals (its pads are q = (n - 1) / 2) and
+ * diagonal d1 of row i1 is the column i1 - q + d1. Interior rows use all n diagonals, the last owned row
+ * (i1 == e_out) uses n - 1 + add, which is how a rectangular matrix is handled.
  *
- * @param mat   matrix data, shape (rows of `out`, 2 * p_in + 1)
+ * @param mat   matrix data, shape (rows of `out`, diagonals)
  * @param x     data of the domain vector, ghost regions included
  * @param out   data of the codomain vector; the owned rows are written
  * @param s_in  global start of the domain of this process
  * @param p_in  padding of the domain
- * @param add   1 if the last row uses all 2 * p_in + 1 diagonals, else 0
+ * @param add   1 if the last row uses all diagonals, else 0
  * @param s_out global start of the codomain of this process
  * @param e_out global end (inclusive) of the codomain of this process
  * @param p_out padding of the codomain: the owned rows start at index p_out of `mat` and `out`
@@ -30,11 +31,13 @@ extern "C" __global__ void stencil_dot_1d(Array2D<double> mat, Array1D<double> x
     if (i1_loc < 0 || i1_loc > e_out - s_out) return;
     const long long i1 = s_out + i1_loc;  // global row index
 
-    const long long n_diags1 = (i1 == e_out) ? 2 * p_in + add : 2 * p_in + 1;
+    const long long n_diags1 = mat.shape[1];
+    const long long nd1 = (i1 == e_out) ? n_diags1 - 1 + add : n_diags1;
+    const long long off1 = p_in - (n_diags1 - 1) / 2 - s_in;  // x index of diagonal 0 minus i1
 
     double val = 0.;
-    for (long long d1 = 0; d1 < n_diags1; ++d1)
-        val += mat(p_out + i1_loc, d1) * x(i1 + d1 - s_in);
+    for (long long d1 = 0; d1 < nd1; ++d1)
+        val += mat(p_out + i1_loc, d1) * x(i1 + d1 + off1);
 
     out(p_out + i1_loc) = val;
 }
