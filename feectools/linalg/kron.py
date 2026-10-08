@@ -11,10 +11,11 @@ from scipy.sparse import kron
 from scipy.sparse import coo_matrix
 
 from feectools.ddm.cart       import CartDecomposition
-from feectools.linalg.basic   import LinearOperator, LinearSolver
+from feectools.linalg.basic   import ComposedLinearOperator, LinearOperator, LinearSolver
 from feectools.linalg.stencil import StencilVectorSpace, StencilVector, StencilMatrix
 
 __all__ = ('KroneckerStencilMatrix',
+           'ComposedKroneckerStencilMatrix',
            'KroneckerLinearSolver',
            'KroneckerDenseMatrix',
            'kronecker_solve')
@@ -34,13 +35,12 @@ class KroneckerStencilMatrix(LinearOperator):
 
     The factors are process-local: along its axes, the factor $A_k$ owns the
     same rows (``starts``/``ends``) as the codomain ``W`` on this process,
-    but it lives on its own spaces, without a communicator.
+    but it lives on its own spaces, without a communicator. The pads of the
+    factors must not exceed the pads of the domain ``V``, whose ghost regions
+    are read by ``dot``.
 
-    A product ``M = A @ B`` of two Kronecker matrices with the same axis
-    groups is again a KroneckerStencilMatrix with factors $C_k = A_k B_k$
-    (see ``__matmul__``). The band of $C_k$ is wider than the ghost regions of
-    the domain, so the operands are stored in ``factors`` and ``dot`` applies
-    them one after another.
+    The product ``A @ B`` of two Kronecker matrices with the same axis groups
+    is a :class:`ComposedKroneckerStencilMatrix`.
 
     Parameters
     ----------
@@ -53,20 +53,11 @@ class KroneckerStencilMatrix(LinearOperator):
     *args : StencilMatrix
         Factors of the Kronecker product, ordered by axis. For each factor
         ``A_k``, ``A_k.domain.npts`` and ``A_k.codomain.npts`` must equal the
-        ``npts`` of ``V`` and ``W`` along the axes of that factor. Unless
-        ``factors`` is given, the pads of ``A_k`` must not exceed the pads
-        of ``V``.
-
-    factors : sequence of KroneckerStencilMatrix, optional
-        Operands $F_1, \dots, F_n$ with $M = F_1 F_2 \cdots F_n$, as created
-        by ``__matmul__``. If given, ``dot`` applies them from right to left.
+        ``npts`` of ``V`` and ``W`` along the axes of that factor. The pads
+        of ``A_k`` must not exceed the pads of ``V``.
     """
 
-    def __init__(self,
-                 V: StencilVectorSpace,
-                 W: StencilVectorSpace,
-                 *args: StencilMatrix,
-                 factors: Sequence[KroneckerStencilMatrix] | None = None):
+    def __init__(self, V: StencilVectorSpace, W: StencilVectorSpace, *args: StencilMatrix):
 
         assert isinstance(V, StencilVectorSpace)
         assert isinstance(W, StencilVectorSpace)
@@ -92,34 +83,17 @@ class KroneckerStencilMatrix(LinearOperator):
         assert d == V.ndim, \
             f'The factors cover {d} axes, but the domain has {V.ndim}.'
 
-        if factors is None:
-            # dot reads the ghost regions of x, so the band must fit into them
-            for A, grp in zip(args, axes):
-                for p, a in zip(A.pads, grp):
-                    if p > V.pads[a]:
-                        raise ValueError(f'Pads {A.pads} of factor on axes {grp} exceed '
-                                         f'the domain pads {V.pads}; pass the operands '
-                                         'as factors (as done by A @ B).')
-            tmp_vectors = ()
-        else:
-            factors = tuple(factors)
-            assert len(factors) > 0
-            for F in factors:
-                assert isinstance(F, KroneckerStencilMatrix)
-                assert F.axes == tuple(axes)
-            assert factors[0].codomain == W
-            assert factors[-1].domain == V
-            for F, G in zip(factors[:-1], factors[1:]):
-                assert F.domain == G.codomain
-            # intermediate results for dot
-            tmp_vectors = tuple(F.codomain.zeros() for F in factors[1:])
+        # dot reads the ghost regions of x, so the band must fit into them
+        for A, grp in zip(args, axes):
+            for p, a in zip(A.pads, grp):
+                if p > V.pads[a]:
+                    raise ValueError(f'Pads {A.pads} of factor on axes {grp} exceed the domain pads {V.pads}. '
+                                     'Products of Kronecker matrices are ComposedKroneckerStencilMatrix (A @ B).')
 
-        self._domain      = V
-        self._codomain    = W
-        self._mats        = tuple(args)
-        self._axes        = tuple(axes)
-        self._factors     = factors
-        self._tmp_vectors = tmp_vectors
+        self._domain   = V
+        self._codomain = W
+        self._mats     = tuple(args)
+        self._axes     = tuple(axes)
 
     #--------------------------------------
     # Abstract interface
@@ -158,18 +132,9 @@ class KroneckerStencilMatrix(LinearOperator):
 
     # ...
     @property
-    def factors(self) -> tuple[KroneckerStencilMatrix, ...] | None:
-        """Operands $F_1, \\dots, F_n$ with ``self == F_1 @ ... @ F_n``, or None if ``self`` is not a product."""
-        return self._factors
-
-    # ...
-    @property
     def nbytes(self) -> int:
-        """Local (per-MPI-rank) memory footprint of the factor matrices (and of the stored operands), in bytes."""
-        nbytes = sum(getattr(mat, 'nbytes', 0) for mat in self._mats)
-        if self._factors is not None:
-            nbytes += sum(F.nbytes for F in self._factors)
-        return int(nbytes)
+        """Local (per-MPI-rank) memory footprint of the factor matrices, in bytes."""
+        return int(sum(getattr(mat, 'nbytes', 0) for mat in self._mats))
 
     # ...
     def dot(self, x: StencilVector, out: StencilVector | None = None) -> StencilVector:
@@ -198,13 +163,6 @@ class KroneckerStencilMatrix(LinearOperator):
             assert out.space is self.codomain
         else:
             out = StencilVector(self.codomain)
-
-        # product of Kronecker matrices: apply the operands one after another
-        if self._factors is not None:
-            y = x
-            for F, tmp in zip(reversed(self._factors[1:]), reversed(self._tmp_vectors)):
-                y = F.dot(y, out=tmp)
-            return self._factors[0].dot(y, out=out)
 
         # Necessary if vector space is periodic or distributed across processes
         if not x.ghost_regions_in_sync:
@@ -247,31 +205,23 @@ class KroneckerStencilMatrix(LinearOperator):
 
     # ...
     def copy(self) -> KroneckerStencilMatrix:
-        mats    = [m.copy() for m in self.mats]
-        factors = None if self._factors is None else [F.copy() for F in self._factors]
-        return KroneckerStencilMatrix(self.domain, self.codomain, *mats, factors=factors)
+        mats = [m.copy() for m in self.mats]
+        return KroneckerStencilMatrix(self.domain, self.codomain, *mats)
 
     # ...
     def __neg__(self) -> KroneckerStencilMatrix:
-        mats    = [-self.mats[0], *(m.copy() for m in self.mats[1:])]
-        factors = None if self._factors is None else \
-            [-self._factors[0], *(F.copy() for F in self._factors[1:])]
-        return KroneckerStencilMatrix(self.domain, self.codomain, *mats, factors=factors)
+        mats = [-self.mats[0], *(m.copy() for m in self.mats[1:])]
+        return KroneckerStencilMatrix(self.domain, self.codomain, *mats)
 
     # ...
     def __mul__(self, a) -> KroneckerStencilMatrix:
-        mats    = [*(m.copy() for m in self.mats[:-1]), self.mats[-1] * a]
-        factors = None if self._factors is None else \
-            [*(F.copy() for F in self._factors[:-1]), self._factors[-1] * a]
-        return KroneckerStencilMatrix(self.domain, self.codomain, *mats, factors=factors)
+        mats = [*(m.copy() for m in self.mats[:-1]), self.mats[-1] * a]
+        return KroneckerStencilMatrix(self.domain, self.codomain, *mats)
 
     # ...
     def __imul__(self, a) -> KroneckerStencilMatrix:
         last  = self._mats[-1]
         last *= a
-        if self._factors is not None:
-            last  = self._factors[-1]
-            last *= a
         return self
 
     # ...
@@ -279,19 +229,11 @@ class KroneckerStencilMatrix(LinearOperator):
         """
         Product ``self @ B``.
 
-        If ``B`` is a KroneckerStencilMatrix with the same axis groups, the
-        result is a KroneckerStencilMatrix with factors
-        ``C_k = self.mats[k] @ B.mats[k]``, domain ``B.domain`` and codomain
-        ``self.codomain``. Copies of the operands are stored in
-        ``factors`` (products are flattened, so ``(A @ B) @ C`` has the
-        factors ``(A, B, C)``) and used by ``dot``.
-
-        This is a collective operation if ``B.codomain`` is distributed: each
-        process needs all rows of ``B.mats[k]`` that its rows of
-        ``self.mats[k]`` couple to, so they are gathered.
-
-        In all other cases (a different operator, other axis groups, or a
-        vector) the call is passed to ``LinearOperator.__matmul__``.
+        If ``B`` is a KroneckerStencilMatrix or a ComposedKroneckerStencilMatrix
+        with the same axis groups, the result is a
+        :class:`ComposedKroneckerStencilMatrix`. In all other cases (a different
+        operator, other axis groups, or a vector) the call is passed to
+        ``LinearOperator.__matmul__``.
 
         Parameters
         ----------
@@ -300,97 +242,12 @@ class KroneckerStencilMatrix(LinearOperator):
 
         Returns
         -------
-        KroneckerStencilMatrix | LinearOperator | Vector
+        ComposedKroneckerStencilMatrix | LinearOperator | Vector
             The product.
         """
-        if not isinstance(B, KroneckerStencilMatrix) or B.axes != self.axes:
-            return super().__matmul__(B)
-
-        assert self.domain == B.codomain, \
-            'The domain of the left operand must be the codomain of the right operand.'
-
-        mats = [self._multiply_factors(A_k, B_k, B.codomain)
-                for A_k, B_k in zip(self.mats, B.mats)]
-
-        factors = (*(self._factors or (self,)), *(B._factors or (B,)))
-        factors = [F.copy() for F in factors]
-
-        return KroneckerStencilMatrix(B.domain, self.codomain, *mats, factors=factors)
-
-    @staticmethod
-    def _multiply_factors(A: StencilMatrix, B: StencilMatrix, U: StencilVectorSpace) -> StencilMatrix:
-        """
-        Compute the process-local factor ``C = A @ B`` of a Kronecker product.
-
-        The product is computed in scipy sparse format. Its band is wider than
-        the ones of ``A`` and ``B``, so ``C`` is stored on new spaces with
-        the decomposition of ``B.domain`` / ``A.codomain`` and larger pads.
-
-        Parameters
-        ----------
-        A, B : StencilMatrix
-            Process-local factors acting on the same axes.
-
-        U : StencilVectorSpace
-            Codomain of the Kronecker matrix of ``B``. If it is distributed,
-            the rows of ``B`` owned by other processes are gathered over its
-            communicator.
-
-        Returns
-        -------
-        StencilMatrix
-            The product, with rows ``A.codomain.starts`` to ``A.codomain.ends``.
-        """
-        for S in (A.domain, A.codomain, B.domain, B.codomain):
-            if any(m != 1 for m in S.shifts):
-                raise NotImplementedError('Products of factors with shifts != 1 are not supported.')
-        assert tuple(A.domain.npts) == tuple(B.codomain.npts)
-        assert tuple(A.codomain.periods) == tuple(B.domain.periods)
-
-        # all rows of B that rows of A on this process can couple to
-        B_sp = B.tosparse().tocoo()
-        if U.parallel:
-            parts = U.cart.comm.allgather((B_sp.row, B_sp.col, B_sp.data))
-            rows  = np.concatenate([p[0] for p in parts]).astype(np.int64)
-            cols  = np.concatenate([p[1] for p in parts]).astype(np.int64)
-            data  = np.concatenate([p[2] for p in parts])
-            # processes with the same rows along these axes send them twice; keep one copy
-            _, idx = np.unique(rows * B_sp.shape[1] + cols, return_index=True)
-            B_sp = coo_matrix((data[idx], (rows[idx], cols[idx])), shape=B_sp.shape)
-
-        C_sp = (A.tosparse().tocsr() @ B_sp.tocsr()).tocoo()
-
-        # band of C: diagonal offset of each entry along each axis
-        cod, dom = A.codomain, B.domain
-        periods  = cod.periods
-        rr = np.unravel_index(C_sp.row, tuple(cod.npts))
-        cc = np.unravel_index(C_sp.col, tuple(dom.npts))
-        kk = []
-        pads = []
-        for d, (pA, pB, n, P) in enumerate(zip(A.pads, B.pads, dom.npts, periods)):
-            k = cc[d] - rr[d]
-            if P:
-                k = (k + n//2) % n - n//2
-                pads.append(min(pA + pB, n//2))
-            else:
-                pads.append(min(pA + pB, n - 1))
-            kk.append(k)
-            assert k.size == 0 or np.abs(k).max() <= pads[-1]
-
-        # new spaces with the same decomposition and wider pads
-        def widen(S):
-            cart = CartDecomposition(S.cart.domain_decomposition, S.npts,
-                                     S.cart.global_starts, S.cart.global_ends,
-                                     pads=pads, shifts=list(S.shifts))
-            return StencilVectorSpace(cart, dtype=C_sp.dtype)
-
-        C = StencilMatrix(widen(dom), widen(cod))
-
-        index = (*(xp.asarray(r - s + p) for r,s,p in zip(rr, cod.starts, pads)),
-                 *(xp.asarray(k + p) for k,p in zip(kk, pads)))
-        C._data[index] = xp.asarray(C_sp.data)
-
-        return C
+        if _is_kronecker_with_axes(B, self.axes):
+            return ComposedKroneckerStencilMatrix(B.domain, self.codomain, self, B)
+        return super().__matmul__(B)
 
     #--------------------------------------
     # Other properties/methods
@@ -409,15 +266,7 @@ class KroneckerStencilMatrix(LinearOperator):
         return reduce(lambda a, b: a * b, elements, 1)
 
     def tostencil(self) -> StencilMatrix:
-        """
-        Convert to a StencilMatrix on the domain and codomain.
-
-        Raises
-        ------
-        ValueError
-            If the band of a factor exceeds the domain pads, e.g. for a product
-            created by ``A @ B``; use ``tosparse`` instead.
-        """
+        """Convert to a StencilMatrix on the domain and codomain."""
 
         mats  = self.mats
         ssc   = self.codomain.starts
@@ -426,11 +275,6 @@ class KroneckerStencilMatrix(LinearOperator):
         eed   = self.domain.ends
         pads  = [p for A in self.mats for p in A.pads]
         xpads = self.domain.pads
-
-        if any(p > xp_ for p,xp_ in zip(pads, xpads)):
-            raise ValueError(f'The pads {tuple(pads)} of the factors exceed the domain pads '
-                             f'{xpads}, so the matrix does not fit into a StencilMatrix on '
-                             'its domain; use tosparse instead.')
 
         # Number of rows in matrix (along each dimension)
         nrows       = [ed-s+1 for s,ed in zip(ssd, eed)]
@@ -500,16 +344,228 @@ class KroneckerStencilMatrix(LinearOperator):
         return self.tosparse().toarray()
 
     def transpose(self, conjugate: bool = False) -> KroneckerStencilMatrix:
-        """
-        Transpose of the matrix (Hermitian transpose if ``conjugate`` is True).
-
-        The factors are transposed; for a product the order of the operands
-        is reversed.
-        """
+        """Transpose of the matrix (Hermitian transpose if ``conjugate`` is True); the factors are transposed."""
         mats_tr = [Mi.transpose(conjugate=conjugate) for Mi in self.mats]
-        factors = None if self._factors is None else \
-            [F.transpose(conjugate=conjugate) for F in reversed(self._factors)]
-        return KroneckerStencilMatrix(self.codomain, self.domain, *mats_tr, factors=factors)
+        return KroneckerStencilMatrix(self.codomain, self.domain, *mats_tr)
+
+#==============================================================================
+class ComposedKroneckerStencilMatrix(ComposedLinearOperator):
+    r"""
+    Product $M = F_1 F_2 \cdots F_n$ of Kronecker matrices with the same axis groups.
+
+    Created by ``A @ B`` of two KroneckerStencilMatrix (or of products of them).
+    As for any :class:`ComposedLinearOperator`, ``multiplicands`` are the
+    operands $F_1, \dots, F_n$ (chains are flattened, so ``(A @ B) @ C`` has
+    the multiplicands ``(A, B, C)``) and ``dot`` applies them from right to left.
+
+    In addition, the product is again a Kronecker product,
+    $M = C_1 \otimes \dots \otimes C_m$ with $C_k = F_{1,k} F_{2,k} \cdots F_{n,k}$,
+    and ``mats`` holds its exact factors $C_k$, computed at construction. Their
+    band is wider than the ghost regions of the domain, so they live on
+    process-local spaces with larger pads. They are used by ``tosparse`` and can
+    be used to build a :class:`KroneckerLinearSolver` for $M$. ``mats`` is a
+    snapshot: changing an operand in place afterwards changes ``dot`` but not
+    ``mats``.
+
+    Constructing the product is collective if the operands are distributed:
+    each process needs all rows of the factors of the right operand that its
+    rows of the left factor couple to, so they are gathered.
+
+    Parameters
+    ----------
+    domain : StencilVectorSpace
+        Domain of the last operand.
+
+    codomain : StencilVectorSpace
+        Codomain of the first operand.
+
+    *args : KroneckerStencilMatrix | ComposedKroneckerStencilMatrix
+        The operands, with the same axis groups.
+    """
+
+    def __init__(self,
+                 domain: StencilVectorSpace,
+                 codomain: StencilVectorSpace,
+                 *args: KroneckerStencilMatrix | ComposedKroneckerStencilMatrix):
+
+        assert len(args) >= 2, 'A ComposedKroneckerStencilMatrix needs at least two operands.'
+        axes = args[0].axes
+        for a in args:
+            assert _is_kronecker_with_axes(a, axes), \
+                'All operands must be Kronecker matrices with the same axis groups.'
+
+        super().__init__(domain, codomain, *args)
+
+        # exact factors of the product, multiplied from the right
+        mats = list(args[-1].mats)
+        for a in reversed(args[:-1]):
+            mats = [_multiply_factors(A_k, C_k, a.domain) for A_k, C_k in zip(a.mats, mats)]
+
+        self._mats = tuple(mats)
+        self._axes = axes
+
+    @classmethod
+    def _from_parts(cls, domain, codomain, multiplicands, mats) -> ComposedKroneckerStencilMatrix:
+        """Build from known operands and factors of the product (no multiplication, not collective)."""
+        obj = cls.__new__(cls)
+        ComposedLinearOperator.__init__(obj, domain, codomain, *multiplicands)
+        obj._mats = tuple(mats)
+        obj._axes = multiplicands[0].axes
+        return obj
+
+    #--------------------------------------
+    # Kronecker structure
+    #--------------------------------------
+    @property
+    def mats(self) -> tuple[StencilMatrix, ...]:
+        """Exact factors $C_k$ of the product, ordered by axis (process-local, wide band)."""
+        return self._mats
+
+    @property
+    def axes(self) -> tuple[tuple[int, ...], ...]:
+        """Axes of the domain/codomain on which each factor acts, e.g. ``((0, 1), (2,))``."""
+        return self._axes
+
+    @property
+    def ndim(self) -> int:
+        """Number of axes of the domain."""
+        return self.domain.ndim
+
+    @property
+    def dtype(self):
+        return self.domain.dtype
+
+    @property
+    def nbytes(self) -> int:
+        """Local (per-MPI-rank) memory footprint of the factors of the product and of the operands, in bytes."""
+        nbytes = sum(getattr(mat, 'nbytes', 0) for mat in self._mats)
+        nbytes += sum(F.nbytes for F in self.multiplicands)
+        return int(nbytes)
+
+    #--------------------------------------
+    # Operations that keep the type
+    #--------------------------------------
+    def copy(self) -> ComposedKroneckerStencilMatrix:
+        return self._from_parts(self.domain, self.codomain,
+                                [F.copy() for F in self.multiplicands],
+                                [m.copy() for m in self.mats])
+
+    def __neg__(self) -> ComposedKroneckerStencilMatrix:
+        return self * -1
+
+    def __mul__(self, a) -> ComposedKroneckerStencilMatrix:
+        multiplicands = [*(F.copy() for F in self.multiplicands[:-1]), self.multiplicands[-1] * a]
+        mats = [*(m.copy() for m in self.mats[:-1]), self.mats[-1] * a]
+        return self._from_parts(self.domain, self.codomain, multiplicands, mats)
+
+    def __rmul__(self, a) -> ComposedKroneckerStencilMatrix:
+        return self * a
+
+    def __matmul__(self, B):
+        """
+        Product ``self @ B``: a ComposedKroneckerStencilMatrix if ``B`` is a Kronecker
+        matrix with the same axis groups, else ``LinearOperator.__matmul__``.
+        """
+        if _is_kronecker_with_axes(B, self.axes):
+            return ComposedKroneckerStencilMatrix(B.domain, self.codomain, self, B)
+        return super().__matmul__(B)
+
+    def transpose(self, conjugate: bool = False) -> ComposedKroneckerStencilMatrix:
+        """Transpose: the operands are transposed in reverse order, and so are the factors of the product."""
+        multiplicands = [F.transpose(conjugate=conjugate) for F in reversed(self.multiplicands)]
+        mats = [m.transpose(conjugate=conjugate) for m in self.mats]
+        return self._from_parts(self.codomain, self.domain, multiplicands, mats)
+
+    #--------------------------------------
+    # Conversion
+    #--------------------------------------
+    def tosparse(self):
+        """Convert the local rows to a scipy sparse matrix (Kronecker product of the factors of the product)."""
+        return reduce(kron, (m.tosparse() for m in self.mats))
+
+    def toarray(self):
+        """Convert the local rows to a dense array."""
+        return self.tosparse().toarray()
+
+#==============================================================================
+def _is_kronecker_with_axes(B, axes) -> bool:
+    """Whether B is a (composed) Kronecker stencil matrix with the given axis groups."""
+    return isinstance(B, (KroneckerStencilMatrix, ComposedKroneckerStencilMatrix)) and B.axes == axes
+
+
+def _multiply_factors(A: StencilMatrix, B: StencilMatrix, U: StencilVectorSpace) -> StencilMatrix:
+    """
+    Compute the process-local factor ``C = A @ B`` of a Kronecker product.
+
+    The product is computed in scipy sparse format. Its band is wider than
+    the ones of ``A`` and ``B``, so ``C`` is stored on new spaces with
+    the decomposition of ``B.domain`` / ``A.codomain`` and larger pads.
+
+    Parameters
+    ----------
+    A, B : StencilMatrix
+        Process-local factors acting on the same axes.
+
+    U : StencilVectorSpace
+        Codomain of the Kronecker matrix of ``B``. If it is distributed,
+        the rows of ``B`` owned by other processes are gathered over its
+        communicator.
+
+    Returns
+    -------
+    StencilMatrix
+        The product, with rows ``A.codomain.starts`` to ``A.codomain.ends``.
+    """
+    for S in (A.domain, A.codomain, B.domain, B.codomain):
+        if any(m != 1 for m in S.shifts):
+            raise NotImplementedError('Products of factors with shifts != 1 are not supported.')
+    assert tuple(A.domain.npts) == tuple(B.codomain.npts)
+    assert tuple(A.codomain.periods) == tuple(B.domain.periods)
+
+    # all rows of B that rows of A on this process can couple to
+    B_sp = B.tosparse().tocoo()
+    if U.parallel:
+        parts = U.cart.comm.allgather((B_sp.row, B_sp.col, B_sp.data))
+        rows  = np.concatenate([p[0] for p in parts]).astype(np.int64)
+        cols  = np.concatenate([p[1] for p in parts]).astype(np.int64)
+        data  = np.concatenate([p[2] for p in parts])
+        # processes with the same rows along these axes send them twice; keep one copy
+        _, idx = np.unique(rows * B_sp.shape[1] + cols, return_index=True)
+        B_sp = coo_matrix((data[idx], (rows[idx], cols[idx])), shape=B_sp.shape)
+
+    C_sp = (A.tosparse().tocsr() @ B_sp.tocsr()).tocoo()
+
+    # band of C: diagonal offset of each entry along each axis
+    cod, dom = A.codomain, B.domain
+    periods  = cod.periods
+    rr = np.unravel_index(C_sp.row, tuple(cod.npts))
+    cc = np.unravel_index(C_sp.col, tuple(dom.npts))
+    kk = []
+    pads = []
+    for d, (pA, pB, n, P) in enumerate(zip(A.pads, B.pads, dom.npts, periods)):
+        k = cc[d] - rr[d]
+        if P:
+            k = (k + n//2) % n - n//2
+            pads.append(min(pA + pB, n//2))
+        else:
+            pads.append(min(pA + pB, n - 1))
+        kk.append(k)
+        assert k.size == 0 or np.abs(k).max() <= pads[-1]
+
+    # new spaces with the same decomposition and wider pads
+    def widen(S):
+        cart = CartDecomposition(S.cart.domain_decomposition, S.npts,
+                                 S.cart.global_starts, S.cart.global_ends,
+                                 pads=pads, shifts=list(S.shifts))
+        return StencilVectorSpace(cart, dtype=C_sp.dtype)
+
+    C = StencilMatrix(widen(dom), widen(cod))
+
+    index = (*(xp.asarray(r - s + p) for r,s,p in zip(rr, cod.starts, pads)),
+             *(xp.asarray(k + p) for k,p in zip(kk, pads)))
+    C._data[index] = xp.asarray(C_sp.data)
+
+    return C
 
 #==============================================================================
 class KroneckerDenseMatrix(LinearOperator):

@@ -124,6 +124,7 @@ from maybempi import MPI
 from feectools.linalg.basic          import ComposedLinearOperator
 from feectools.linalg.direct_solvers import SparseSolver
 from feectools.linalg.kron           import KroneckerLinearSolver, kronecker_solve
+from feectools.linalg.kron           import ComposedKroneckerStencilMatrix
 
 
 def make_space(comm, npts, pads, periods, mpi_dims_mask=None):
@@ -227,7 +228,6 @@ def check_grouped_kron(comm, factor_ndims):
 
     assert M.ndim == 3
     assert len(M.axes) == len(factor_ndims)
-    assert M.factors is None
 
     # dot
     assert_local_equal(W, M.dot(w), Md @ wglob)
@@ -261,13 +261,11 @@ def check_matmul(comm, factor_ndims):
     rows = local_rows(W)
 
     C = A @ B
-    assert isinstance(C, KroneckerStencilMatrix)
+    assert type(C) is ComposedKroneckerStencilMatrix
+    assert isinstance(C, ComposedLinearOperator)
     assert C.domain is B.domain and C.codomain is A.codomain
-    assert C.axes == A.axes
-    assert len(C.factors) == 2
-    for F, G in zip(C.factors, (A, B)):
-        assert F is not G
-        assert all(np.array_equal(xp.to_numpy(f._data), xp.to_numpy(g._data)) for f, g in zip(F.mats, G.mats))
+    assert C.axes == A.axes and C.ndim == 3
+    assert C.multiplicands == (A, B)
     for Ck, Ak, Bk in zip(C.mats, A.mats, B.mats):
         assert Ck.pads == tuple(min(pa + pb, n//2 if P else n-1) for pa, pb, n, P
                                 in zip(Ak.pads, Bk.pads, Ak.domain.npts, Ak.domain.periods))
@@ -279,38 +277,39 @@ def check_matmul(comm, factor_ndims):
     assert C.dot(w, out=out) is out
     assert_local_equal(W, out, Ad @ Bd @ wglob)
 
-    # chains are flattened
-    D = C @ A
-    assert len(D.factors) == 3
-    assert np.allclose(D.tosparse().tocsr()[rows].toarray(), (Ad @ Bd @ Ad)[rows])
-    assert_local_equal(W, D.dot(w), Ad @ Bd @ Ad @ wglob)
+    # chains are flattened, on both sides
+    for D in (C @ A, A @ (B @ A), (A @ B) @ A):
+        assert type(D) is ComposedKroneckerStencilMatrix
+        assert D.multiplicands == (A, B, A)
+        assert np.allclose(D.tosparse().tocsr()[rows].toarray(), (Ad @ Bd @ Ad)[rows])
+        assert_local_equal(W, D.dot(w), Ad @ Bd @ Ad @ wglob)
 
-    # scaling, copy
-    assert_local_equal(W, (C * 2.).dot(w), 2. * Ad @ Bd @ wglob)
-    assert_local_equal(W, (-C).dot(w), -Ad @ Bd @ wglob)
-    assert_local_equal(W, C.copy().dot(w), Ad @ Bd @ wglob)
+    # scaling, copy (keep the type, leave C unchanged)
+    for C2, f in ((C * 2., 2.), (2. * C, 2.), (-C, -1.), (C.copy(), 1.)):
+        assert type(C2) is ComposedKroneckerStencilMatrix
+        assert_local_equal(W, C2.dot(w), f * Ad @ Bd @ wglob)
+        assert np.allclose(C2.tosparse().tocsr()[rows].toarray(), f * (Ad @ Bd)[rows])
     C2 = C.copy()
     C2 *= 0.5
     assert_local_equal(W, C2.dot(w), 0.5 * Ad @ Bd @ wglob)
-    assert np.allclose(C2.tosparse().tocsr()[rows].toarray(), 0.5 * (Ad @ Bd)[rows])
     assert_local_equal(W, C.dot(w), Ad @ Bd @ wglob)
+    assert np.allclose(C.tosparse().tocsr()[rows].toarray(), (Ad @ Bd)[rows])
 
-    # the band does not fit into the ghost regions
-    with pytest.raises(ValueError):
-        C.tostencil()
+    # the factors of the product do not fit into the ghost regions of the domain
     with pytest.raises(ValueError):
         KroneckerStencilMatrix(W, W, *C.mats)
 
     # transpose (process-local factors are only complete in serial)
     if comm is None:
+        assert type(C.T) is ComposedKroneckerStencilMatrix
         assert np.allclose(C.T.toarray(), (Ad @ Bd).T)
         assert_local_equal(W, C.T.dot(w), (Ad @ Bd).T @ wglob)
 
     # other operands fall back to LinearOperator.__matmul__
     E, Ed, _, _ = make_kron(W, (1, 1, 1) if factor_ndims != (1, 1, 1) else (2, 1), [1, 1, 1], seed=40)
-    AE = A @ E
-    assert isinstance(AE, ComposedLinearOperator)
-    assert_local_equal(W, AE.dot(w), Ad @ Ed @ wglob)
+    for AE in (A @ E, C @ E):
+        assert type(AE) is ComposedLinearOperator
+    assert_local_equal(W, (A @ E).dot(w), Ad @ Ed @ wglob)
     assert_local_equal(W, A @ w, Ad @ wglob)
 
 
@@ -328,6 +327,7 @@ def check_solver(comm, factor_ndims, mpi_dims_mask=None):
 
     # solver for a product of Kronecker matrices (the factors hold all rows only in serial)
     C = M @ M
+    assert type(C) is ComposedKroneckerStencilMatrix
     if comm is None:
         S2 = KroneckerLinearSolver(W, W, [SparseSolver(Ck.tosparse().tocsr()) for Ck in C.mats],
                                    factor_ndims=factor_ndims)
@@ -384,3 +384,11 @@ def test_kron_solver_distributed_group_par():
     _, _, _, dense = make_kron(W, (2, 1), [1, 1, 1], seed=0)
     with pytest.raises(NotImplementedError):
         KroneckerLinearSolver(W, W, [SparseSolver(csr_matrix(D)) for D in dense], factor_ndims=(2, 1))
+
+
+def test_multiplicants_deprecated():
+    W = make_space(None, NPTS, PADS, PERIODS)
+    A = make_kron(W, (1, 1, 1), [1, 1, 1], seed=0)[0]
+    C = ComposedLinearOperator(W, W, A, A)
+    with pytest.warns(DeprecationWarning):
+        assert C.multiplicants == C.multiplicands == (A, A)
