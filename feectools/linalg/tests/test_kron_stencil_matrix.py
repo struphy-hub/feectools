@@ -113,3 +113,414 @@ def test_KroneckerStencilMatrix(dtype, npts, pads, periodic):
     # Test dot product
     expected = M_sp.dot(xp.to_numpy(w.toarray()))
     assert xp.array_equal(xp.asarray(expected), M.dot(w).toarray())
+
+#===============================================================================
+# Kronecker matrices with factors on groups of axes, products and solvers
+#===============================================================================
+import numpy as np
+from scipy.sparse import csr_matrix
+
+from maybempi import MPI
+from feectools.linalg.basic          import ComposedLinearOperator
+from feectools.linalg.direct_solvers import SparseSolver
+from feectools.linalg.kron           import KroneckerLinearSolver, kronecker_solve
+from feectools.linalg.kron           import ComposedKroneckerStencilMatrix
+
+
+def make_space(comm, npts, pads, periods, mpi_dims_mask=None):
+    """Distributed StencilVectorSpace (serial if comm is None)."""
+    D = DomainDecomposition([n-1 for n in npts], periods=periods, comm=comm,
+                            mpi_dims_mask=mpi_dims_mask)
+    global_starts, global_ends = compute_global_starts_ends(D, npts)
+    cart = CartDecomposition(D, npts, global_starts, global_ends, pads=pads, shifts=[1]*len(npts))
+    return StencilVectorSpace(cart)
+
+
+def make_factor(W, grp, mpads, seed, full_rows=False, rows=None):
+    """
+    Process-local factor on the axes grp of W (rows owned by this process, all rows if
+    full_rows, or the given (starts, ends)), with band mpads and random entries; also
+    returns the global dense matrix.
+    """
+    npts    = [W.npts[a] for a in grp]
+    periods = [W.periods[a] for a in grp]
+    spads   = list(mpads)  # factor space pads may be smaller than the ones of W
+    starts  = [W.starts[a] for a in grp]
+    ends    = [W.ends[a] for a in grp]
+    if full_rows:
+        starts, ends = [0] * len(grp), [n - 1 for n in npts]
+    if rows is not None:
+        starts, ends = rows
+
+    D    = DomainDecomposition([n-1 for n in npts], periods=periods)
+    cart = CartDecomposition(D, npts, [np.array([s]) for s in starts], [np.array([e]) for e in ends],
+                             pads=spads, shifts=[1]*len(grp))
+    V    = StencilVectorSpace(cart)
+    M    = StencilMatrix(V, V, pads=tuple(mpads))
+
+    # same random values on all processes; diagonally dominant
+    rng    = np.random.default_rng(seed)
+    ndiags = tuple(2*p+1 for p in mpads)
+    vals   = rng.random(tuple(npts) + ndiags)
+    vals[(Ellipsis, *mpads)] += 2 * np.prod(ndiags)
+
+    N     = int(np.prod(npts))
+    dense = np.zeros((N, N))
+    for i in np.ndindex(*npts):
+        for kk in np.ndindex(*ndiags):
+            col = []
+            for i_d, k_d, p, n, P in zip(i, kk, mpads, npts, periods):
+                c = i_d + k_d - p
+                if P:
+                    c %= n
+                elif not 0 <= c < n:
+                    break
+                col.append(c)
+            else:
+                v = vals[(*i, *kk)]
+                dense[np.ravel_multi_index(i, npts), np.ravel_multi_index(col, npts)] += v
+                if all(s <= i_d <= e for i_d, s, e in zip(i, starts, ends)):
+                    M._data[(*(i_d - s + sp for i_d, s, sp in zip(i, starts, spads)), *kk)] = v
+    return M, dense
+
+
+def local_slices(W):
+    return tuple(slice(s, e+1) for s, e in zip(W.starts, W.ends))
+
+
+def local_rows(W):
+    """Flattened (C order) global indices of the rows owned by this process."""
+    grids = np.meshgrid(*[np.arange(s, e+1) for s, e in zip(W.starts, W.ends)], indexing='ij')
+    return np.ravel_multi_index(tuple(g.ravel() for g in grids), tuple(W.npts))
+
+
+def random_vector(W, seed):
+    wglob = np.random.default_rng(seed).random(tuple(W.npts))
+    w = StencilVector(W)
+    w[local_slices(W)] = xp.asarray(wglob[local_slices(W)])
+    return w, wglob.ravel()
+
+
+def assert_local_equal(W, y, expected):
+    y_loc = xp.to_numpy(y[local_slices(W)])
+    assert np.allclose(y_loc, expected.reshape(tuple(W.npts))[local_slices(W)], rtol=1e-12, atol=1e-12)
+
+
+def make_kron(W, factor_ndims, mpads, seed, full_rows=False):
+    axes, d = [], 0
+    for n in factor_ndims:
+        axes.append(tuple(range(d, d + n)))
+        d += n
+    mats, dense = [], []
+    for k, grp in enumerate(axes):
+        M, Md = make_factor(W, grp, [mpads[a] for a in grp], seed + k, full_rows=full_rows)
+        mats.append(M)
+        dense.append(Md)
+    from functools import reduce as _reduce
+    return KroneckerStencilMatrix(W, W, *mats), _reduce(np.kron, dense), mats, dense
+
+
+NPTS    = [6, 7, 8]
+PADS    = [2, 2, 3]
+PERIODS = [True, False, True]
+GROUPS  = [(1, 1, 1), (2, 1), (1, 2), (3,)]
+
+
+def check_grouped_kron(comm, factor_ndims):
+    W = make_space(comm, NPTS, PADS, PERIODS)
+    M, Md, _, _ = make_kron(W, factor_ndims, [1, 2, 2], seed=10)
+    w, wglob = random_vector(W, seed=1)
+
+    assert M.ndim == 3
+    assert len(M.axes) == len(factor_ndims)
+
+    # dot
+    assert_local_equal(W, M.dot(w), Md @ wglob)
+
+    # tosparse (local rows)
+    rows = local_rows(W)
+    assert np.allclose(M.tosparse().tocsr()[rows].toarray(), Md[rows])
+
+    # __getitem__: row i, diagonal offset k
+    i = tuple(W.starts)
+    k = (1, -1, 2)
+    col = [(ii + kk) % n for ii, kk, n in zip(i, k, NPTS)]
+    assert np.isclose(float(M[(*i, *k)]),
+                      Md[np.ravel_multi_index(i, NPTS), np.ravel_multi_index(col, NPTS)])
+
+    # scaling
+    assert_local_equal(W, (M * 3.).dot(w), 3. * Md @ wglob)
+    assert_local_equal(W, (-M).dot(w), -Md @ wglob)
+
+    # tostencil, transpose (process-local factors are only complete in serial)
+    if comm is None:
+        assert np.allclose(M.tostencil().toarray(), Md)
+        assert np.allclose(M.T.toarray(), Md.T)
+
+
+def check_matmul(comm, factor_ndims):
+    W = make_space(comm, NPTS, PADS, PERIODS)
+    A, Ad, _, _ = make_kron(W, factor_ndims, [1, 2, 2], seed=20)
+    B, Bd, _, _ = make_kron(W, factor_ndims, [2, 1, 3], seed=30)
+    w, wglob = random_vector(W, seed=2)
+    rows = local_rows(W)
+
+    C = A @ B
+    assert type(C) is ComposedKroneckerStencilMatrix
+    assert isinstance(C, ComposedLinearOperator)
+    assert C.domain is B.domain and C.codomain is A.codomain
+    assert C.axes == A.axes and C.ndim == 3
+    assert C.multiplicands == (A, B)
+    for Ck, Ak, Bk in zip(C.mats, A.mats, B.mats):
+        assert Ck.pads == tuple(min(pa + pb, n//2 if P else n-1) for pa, pb, n, P
+                                in zip(Ak.pads, Bk.pads, Ak.domain.npts, Ak.domain.periods))
+
+    # exact factors and dot through the operands
+    assert np.allclose(C.tosparse().tocsr()[rows].toarray(), (Ad @ Bd)[rows])
+    assert_local_equal(W, C.dot(w), Ad @ Bd @ wglob)
+    out = StencilVector(W)
+    assert C.dot(w, out=out) is out
+    assert_local_equal(W, out, Ad @ Bd @ wglob)
+
+    # chains are flattened, on both sides
+    for D in (C @ A, A @ (B @ A), (A @ B) @ A):
+        assert type(D) is ComposedKroneckerStencilMatrix
+        assert D.multiplicands == (A, B, A)
+        assert np.allclose(D.tosparse().tocsr()[rows].toarray(), (Ad @ Bd @ Ad)[rows])
+        assert_local_equal(W, D.dot(w), Ad @ Bd @ Ad @ wglob)
+
+    # scaling, copy (keep the type, leave C unchanged)
+    for C2, f in ((C * 2., 2.), (2. * C, 2.), (-C, -1.), (C.copy(), 1.)):
+        assert type(C2) is ComposedKroneckerStencilMatrix
+        assert_local_equal(W, C2.dot(w), f * Ad @ Bd @ wglob)
+        assert np.allclose(C2.tosparse().tocsr()[rows].toarray(), f * (Ad @ Bd)[rows])
+    C2 = C.copy()
+    C2 *= 0.5
+    assert_local_equal(W, C2.dot(w), 0.5 * Ad @ Bd @ wglob)
+    assert_local_equal(W, C.dot(w), Ad @ Bd @ wglob)
+    assert np.allclose(C.tosparse().tocsr()[rows].toarray(), (Ad @ Bd)[rows])
+
+    # the factors of the product do not fit into the ghost regions of the domain
+    with pytest.raises(ValueError):
+        KroneckerStencilMatrix(W, W, *C.mats)
+
+    # transpose (process-local factors are only complete in serial)
+    if comm is None:
+        assert type(C.T) is ComposedKroneckerStencilMatrix
+        assert np.allclose(C.T.toarray(), (Ad @ Bd).T)
+        assert_local_equal(W, C.T.dot(w), (Ad @ Bd).T @ wglob)
+
+    # other operands fall back to LinearOperator.__matmul__
+    E, Ed, _, _ = make_kron(W, (1, 1, 1) if factor_ndims != (1, 1, 1) else (2, 1), [1, 1, 1], seed=40)
+    for AE in (A @ E, C @ E):
+        assert type(AE) is ComposedLinearOperator
+    assert_local_equal(W, (A @ E).dot(w), Ad @ Ed @ wglob)
+    assert_local_equal(W, A @ w, Ad @ wglob)
+
+
+def check_solver(comm, factor_ndims, mpi_dims_mask=None):
+    W = make_space(comm, NPTS, PADS, PERIODS, mpi_dims_mask=mpi_dims_mask)
+    M, Md, _, dense = make_kron(W, factor_ndims, [1, 2, 2], seed=50)
+    solvers = [SparseSolver(csr_matrix(D)) for D in dense]
+    b, bglob = random_vector(W, seed=3)
+
+    S = KroneckerLinearSolver(W, W, solvers, factor_ndims=factor_ndims)
+    assert S.factor_ndims == factor_ndims
+    assert_local_equal(W, S.solve(b), np.linalg.solve(Md, bglob))
+    assert_local_equal(W, kronecker_solve(solvers, b, factor_ndims=factor_ndims), np.linalg.solve(Md, bglob))
+    assert_local_equal(W, S.T.solve(b), np.linalg.solve(Md.T, bglob))
+
+    # solver for a product of Kronecker matrices (the factors hold all rows only in serial)
+    C = M @ M
+    assert type(C) is ComposedKroneckerStencilMatrix
+    if comm is None:
+        S2 = KroneckerLinearSolver(W, W, [SparseSolver(Ck.tosparse().tocsr()) for Ck in C.mats],
+                                   factor_ndims=factor_ndims)
+        assert_local_equal(W, S2.solve(b), np.linalg.solve(Md @ Md, bglob))
+
+
+#===============================================================================
+@pytest.mark.parametrize('factor_ndims', GROUPS)
+def test_grouped_kron_ser(factor_ndims):
+    check_grouped_kron(None, factor_ndims)
+
+@pytest.mark.parametrize('factor_ndims', GROUPS)
+def test_kron_matmul_ser(factor_ndims):
+    check_matmul(None, factor_ndims)
+
+@pytest.mark.parametrize('factor_ndims', GROUPS)
+def test_kron_solver_groups_ser(factor_ndims):
+    check_solver(None, factor_ndims)
+
+def test_kron_constructor_checks():
+    W = make_space(None, NPTS, PADS, PERIODS)
+    M, _, mats, _ = make_kron(W, (2, 1), [1, 1, 1], seed=0)
+    with pytest.raises(AssertionError):
+        KroneckerStencilMatrix(W, W, mats[0])                      # too few axes
+    with pytest.raises(AssertionError):
+        KroneckerStencilMatrix(W, W, mats[1], mats[0])             # npts do not match
+    with pytest.raises(AssertionError):
+        KroneckerStencilMatrix(W, W, *mats, mats[1])               # too many axes
+    with pytest.raises(AssertionError):
+        KroneckerLinearSolver(W, W, [SparseSolver(csr_matrix(np.eye(2)))] * 2, factor_ndims=(1, 1))
+
+@pytest.mark.mpi
+@pytest.mark.parametrize('factor_ndims', GROUPS)
+def test_grouped_kron_par(factor_ndims):
+    check_grouped_kron(MPI.COMM_WORLD, factor_ndims)
+
+@pytest.mark.mpi
+@pytest.mark.parametrize('factor_ndims', GROUPS)
+def test_kron_matmul_par(factor_ndims):
+    check_matmul(MPI.COMM_WORLD, factor_ndims)
+
+@pytest.mark.mpi
+@pytest.mark.parametrize('factor_ndims', [(1, 1, 1), (2, 1)])
+def test_kron_solver_groups_par(factor_ndims):
+    # grouped axes are not distributed: only the last axis is
+    check_solver(MPI.COMM_WORLD, factor_ndims, mpi_dims_mask=[False, False, True])
+
+@pytest.mark.mpi
+def test_kron_solver_distributed_group_par():
+    comm = MPI.COMM_WORLD
+    if comm.Get_size() == 1:
+        pytest.skip('needs more than one process')
+    W = make_space(comm, NPTS, PADS, PERIODS, mpi_dims_mask=[True, False, False])
+    _, _, _, dense = make_kron(W, (2, 1), [1, 1, 1], seed=0)
+    with pytest.raises(NotImplementedError):
+        KroneckerLinearSolver(W, W, [SparseSolver(csr_matrix(D)) for D in dense], factor_ndims=(2, 1))
+
+
+def test_multiplicants_deprecated():
+    W = make_space(None, NPTS, PADS, PERIODS)
+    A = make_kron(W, (1, 1, 1), [1, 1, 1], seed=0)[0]
+    C = ComposedLinearOperator(W, W, A, A)
+    with pytest.warns(DeprecationWarning):
+        assert C.multiplicants == C.multiplicands == (A, A)
+
+
+#===============================================================================
+# KroneckerSumSolver (fast diagonalization)
+#===============================================================================
+from feectools.linalg.kron import KroneckerSumSolver
+
+
+def laplace_1d(n, periodic, seed):
+    """1d stiffness (random positive weights on a difference operator) and mass matrix."""
+    rng = np.random.default_rng(seed)
+    nd = n if periodic else n - 1
+    D = np.zeros((nd, n))
+    for r in range(nd):
+        D[r, r] = -1.
+        D[r, (r + 1) % n] = 1.
+    S = D.T @ np.diag(1. + rng.random(nd)) @ D
+    B = rng.random((n, n)) * (np.abs(np.subtract.outer(np.arange(n), np.arange(n))) <= 2)
+    M = B @ B.T + n * np.eye(n)
+    return S, M
+
+
+def check_sum_solver(comm, sigma, with_none):
+    npts, periods = [6, 7, 8], [True, False, True]
+    W = make_space(comm, npts, [2, 2, 3], periods)
+    S, M = zip(*(laplace_1d(n, P, seed=d) for d, (n, P) in enumerate(zip(npts, periods))))
+    S = list(S)
+    if with_none:
+        S[1] = None
+
+    def kron_term(d):
+        mats = [M[e] if e != d else S[d] for e in range(3)]
+        return reduce(np.kron, mats)
+
+    A = sum(kron_term(d) for d in range(3) if S[d] is not None) + sigma * reduce(np.kron, M)
+    solver = KroneckerSumSolver(W, S, M, sigma=sigma)
+
+    if sigma > 0:
+        b, bglob = random_vector(W, seed=4)
+        assert_local_equal(W, solver.dot(b), np.linalg.solve(A, bglob))
+    else:
+        # singular (constants of the periodic directions are in the kernel): pseudo-inverse,
+        # exact for right-hand sides in the range of A
+        bglob = A @ np.random.default_rng(5).random(A.shape[0])
+        b = StencilVector_from(W, bglob)
+        x = solver.dot(b)
+        assert_local_equal(W, StencilVector_from(W, A @ local_to_global(W, x)), bglob)
+    assert solver.transpose() is solver
+
+
+def local_to_global(W, x):
+    """Gather a distributed StencilVector into a global array (all processes)."""
+    glob = np.zeros(tuple(W.npts))
+    glob[local_slices(W)] = xp.to_numpy(x[local_slices(W)])
+    comm = W.cart.comm if W.parallel else None
+    if comm is not None:
+        glob = comm.allreduce(glob)
+    return glob.ravel()
+
+
+def StencilVector_from(W, glob):
+    v = StencilVector(W)
+    v[local_slices(W)] = xp.asarray(glob.reshape(tuple(W.npts))[local_slices(W)])
+    return v
+
+
+@pytest.mark.parametrize('sigma', [0.7, 0.])
+@pytest.mark.parametrize('with_none', [False, True])
+def test_kron_sum_solver_ser(sigma, with_none):
+    check_sum_solver(None, sigma, with_none)
+
+@pytest.mark.mpi
+@pytest.mark.parametrize('sigma', [0.7, 0.])
+@pytest.mark.parametrize('with_none', [False, True])
+def test_kron_sum_solver_par(sigma, with_none):
+    check_sum_solver(MPI.COMM_WORLD, sigma, with_none)
+
+
+#===============================================================================
+# Row layout of the factors, duplicate entries of periodic factors
+#===============================================================================
+def check_full_row_factors(comm, factor_ndims):
+    """Factors owning all rows (not only the ones of W on this process)."""
+    W = make_space(comm, NPTS, PADS, PERIODS)
+    M, Md, _, _ = make_kron(W, factor_ndims, [1, 2, 2], seed=60, full_rows=True)
+    w, wglob = random_vector(W, seed=6)
+    assert_local_equal(W, M.dot(w), Md @ wglob)
+    rows = local_rows(W)
+    assert np.allclose(M.tostencil().tosparse().tocsr()[rows].toarray(), Md[rows])
+
+
+@pytest.mark.parametrize('factor_ndims', [(1, 1, 1), (2, 1)])
+def test_kron_full_row_factors_ser(factor_ndims):
+    check_full_row_factors(None, factor_ndims)
+
+@pytest.mark.mpi
+@pytest.mark.parametrize('factor_ndims', [(1, 1, 1), (2, 1)])
+def test_kron_full_row_factors_par(factor_ndims):
+    check_full_row_factors(MPI.COMM_WORLD, factor_ndims)
+
+
+def test_kron_factor_rows_must_contain_local_rows():
+    W = make_space(None, NPTS, PADS, PERIODS)
+    good = [make_factor(W, (a,), [1], seed=a)[0] for a in range(3)]
+    # factor on axis 0 owning only the rows 1, ..., n-1 (row 0 of W is missing)
+    bad = make_factor(W, (0,), [1], seed=0, rows=([1], [NPTS[0] - 1]))[0]
+    with pytest.raises(ValueError):
+        KroneckerStencilMatrix(W, W, bad, *good[1:])
+
+
+def check_matmul_periodic_duplicates(comm):
+    """Periodic direction with 2p + 1 > n: two diagonals hit the same column."""
+    npts, pads, periods = [4, 7, 8], [2, 2, 3], [True, False, True]
+    W = make_space(comm, npts, pads, periods, mpi_dims_mask=[False, True, True])
+    A, Ad, _, _ = make_kron(W, (1, 1, 1), [2, 1, 2], seed=70)
+    B, Bd, _, _ = make_kron(W, (1, 1, 1), [2, 2, 1], seed=80)
+    rows = local_rows(W)
+    C = A @ B
+    assert np.allclose(C.tosparse().tocsr()[rows].toarray(), (Ad @ Bd)[rows])
+
+
+def test_kron_matmul_periodic_duplicates_ser():
+    check_matmul_periodic_duplicates(None)
+
+@pytest.mark.mpi
+def test_kron_matmul_periodic_duplicates_par():
+    check_matmul_periodic_duplicates(MPI.COMM_WORLD)

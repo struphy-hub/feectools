@@ -594,9 +594,9 @@ class DiscreteBilinearForm:
                     if is_conformal:
                         matrix[k1, k2] = global_mats[k1, k2]
                     elif use_restriction:
-                        matrix.multiplicants[-1][k1, k2] = global_mats[k1, k2]
+                        matrix.multiplicands[-1][k1, k2] = global_mats[k1, k2]
                     elif use_prolongation:
-                        matrix.multiplicants[0][k1, k2] = global_mats[k1, k2]
+                        matrix.multiplicands[0][k1, k2] = global_mats[k1, k2]
 
         else: # case of scalar equation
             if is_broken: # multi-patch

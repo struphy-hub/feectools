@@ -8,6 +8,7 @@ provides the fundamental classes for linear algebra operations.
 """
 
 import itertools
+import warnings
 from abc import ABC, abstractmethod
 from types import LambdaType 
 from inspect import signature
@@ -1057,27 +1058,27 @@ class ComposedLinearOperator(LinearOperator):
         for i in range(len(args)-1):
             assert args[i].domain == args[i+1].codomain
 
-        multiplicants = ()
+        multiplicands = ()
         tmp_vectors = []
         for a in args[:-1]:
             if isinstance(a, ComposedLinearOperator):
-                multiplicants = (*multiplicants, *a.multiplicants)
+                multiplicands = (*multiplicands, *a.multiplicands)
                 tmp_vectors.extend(a.tmp_vectors)
                 tmp_vectors.append(a.domain.zeros())
             else:
-                multiplicants = (*multiplicants, a)
+                multiplicands = (*multiplicands, a)
                 tmp_vectors.append(a.domain.zeros())
 
         last = args[-1]
         if isinstance(last, ComposedLinearOperator):
-            multiplicants = (*multiplicants, *last.multiplicants)
+            multiplicands = (*multiplicands, *last.multiplicands)
             tmp_vectors.extend(last.tmp_vectors)
         else:
-            multiplicants = (*multiplicants, last)
+            multiplicands = (*multiplicands, last)
 
         self._domain = domain
         self._codomain = codomain
-        self._multiplicants = multiplicants
+        self._multiplicands = multiplicands
         self._tmp_vectors = tuple(tmp_vectors)
 
     @property
@@ -1098,34 +1099,41 @@ class ComposedLinearOperator(LinearOperator):
         return self._codomain
 
     @property
-    def multiplicants(self):
+    def multiplicands(self):
         r"""
-        A tuple $(A_1,\dots,A_n)$ containing the multiplicants of the linear operator 
+        A tuple $(A_1,\dots,A_n)$ containing the multiplicands of the linear operator 
         $self = A_n\circ\dots\circ A_1$.
         
         """
-        return self._multiplicants
+        return self._multiplicands
+
+    @property
+    def multiplicants(self):
+        """Deprecated alias of ``multiplicands``."""
+        warnings.warn("ComposedLinearOperator.multiplicants is deprecated, use multiplicands instead.",
+                      DeprecationWarning, stacklevel=2)
+        return self._multiplicands
 
     @property
     def dtype(self):
         return None
 
     def tosparse(self):
-        mats = [M.tosparse() for M in self._multiplicants]
+        mats = [M.tosparse() for M in self._multiplicands]
         M = mats[0]
         for Mi in mats[1:]:
             M = M @ Mi
         return coo_matrix(M)
 
     def transpose(self, conjugate=False):
-        t_multiplicants = ()
-        for a in self._multiplicants:
-            t_multiplicants = (a.transpose(conjugate=conjugate), *t_multiplicants)
+        t_multiplicands = ()
+        for a in self._multiplicands:
+            t_multiplicands = (a.transpose(conjugate=conjugate), *t_multiplicands)
         new_dom = self.codomain
         new_cod = self.domain
         assert isinstance(new_dom, VectorSpace)
         assert isinstance(new_cod, VectorSpace)
-        return ComposedLinearOperator(self.codomain, self.domain, *t_multiplicants)
+        return ComposedLinearOperator(self.codomain, self.domain, *t_multiplicands)
 
     def dot(self, v, out=None):
         assert isinstance(v, Vector)
@@ -1137,11 +1145,11 @@ class ComposedLinearOperator(LinearOperator):
         x = v
         for i in range(len(self._tmp_vectors)):
             y = self._tmp_vectors[-1-i]
-            A = self._multiplicants[-1-i]
+            A = self._multiplicands[-1-i]
             A.dot(x, out=y)
             x = y
 
-        A = self._multiplicants[0]
+        A = self._multiplicands[0]
         if out is not None:
 
             A.dot(x, out=out)
@@ -1150,11 +1158,11 @@ class ComposedLinearOperator(LinearOperator):
         return out
 
     def exchange_assembly_data(self):
-        for op in self._multiplicants:
+        for op in self._multiplicands:
             op.exchange_assembly_data()
 
     def set_backend(self, backend, precompiled=False):
-        for op in self._multiplicants:
+        for op in self._multiplicands:
             op.set_backend(backend)
 
 #===============================================================================

@@ -136,6 +136,21 @@ class DirectionalDerivativeOperator(LinearOperator):
     def dtype( self ):
         return self.domain.dtype
 
+    @property
+    def diffdir(self) -> int:
+        """Direction (axis) of the derivative."""
+        return self._diffdir
+
+    @property
+    def negative(self) -> bool:
+        """Whether the operator is the negative derivative."""
+        return self._negative
+
+    @property
+    def transposed(self) -> bool:
+        """Whether the operator is the transposed derivative."""
+        return self._transposed
+
     def __truediv__(self, a):
         """ Divide by scalar. """
         return self * (1.0 / a)
