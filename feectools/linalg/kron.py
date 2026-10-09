@@ -1391,9 +1391,10 @@ class KroneckerSumSolver(LinearOperator):
         A^{-1} = U \, \Lambda^{-1} \, U^T \,.
 
     This is exact if the $U_d$ diagonalize the $F_{t,d}$, e.g. for $F_{t,d} = M_d$, or for
-    $F_{t,d} = c_d c_d^T$ with $c_d = M_d \mathbb 1$ when the constants are a (simple) eigenvector,
-    i.e. $S_d \mathbb 1 = 0$ (a projection removing the mean in a periodic direction). Otherwise
-    the additional terms are replaced by their diagonal in the eigenbasis (an approximation).
+    $F_{t,d} = c_d c_d^T / (\mathbb 1^T c_d)$ with $c_d = M_d \mathbb 1$ when the constants are a
+    (simple) eigenvector, i.e. $S_d \mathbb 1 = 0$: then $U_d^T F_{t,d} U_d = e_0 e_0^T$, and
+    $M_d - F_{t,d}$ removes the mean (e.g. in a periodic direction). Otherwise the additional terms
+    are replaced by their diagonal in the eigenbasis (an approximation).
     The stiffness $S_d$ defines the eigenbasis also for $a_d = 0$.
 
     The dense matrices $U_d^T$ and $U_d$ are applied with KroneckerLinearSolver (also along
@@ -1417,6 +1418,9 @@ class KroneckerSumSolver(LinearOperator):
 
     rtol : float
         Entries of $\Lambda$ with ``|lambda| <= rtol * max|Lambda|`` are treated as zero (pseudo-inverse).
+        Without ``stiffness_coeffs`` and ``mass_terms``, ``max|Lambda|`` is estimated by
+        ``n * max|lambda_d| + |sigma|`` (as before); otherwise it is the maximum of the assembled
+        diagonal (the terms may cancel).
 
     stiffness_coeffs : sequence of float, optional
         Coefficients $a_d$ of the stiffness terms (default 1).
@@ -1461,6 +1465,7 @@ class KroneckerSumSolver(LinearOperator):
 
         assert isinstance(V, StencilVectorSpace)
         assert len(stiffness) == len(mass) == V.ndim
+        stiffness_coeffs_given = stiffness_coeffs is not None
         if stiffness_coeffs is None:
             stiffness_coeffs = [1.0] * V.ndim
         assert len(stiffness_coeffs) == V.ndim
@@ -1493,7 +1498,7 @@ class KroneckerSumSolver(LinearOperator):
         Lam = np.asarray(Lam).reshape(local_shape)
 
         # additional terms: their diagonal in the eigenbasis, diag(U_d^T F U_d) (1 for F = M_d)
-        term_max = 0.0
+        generalized = stiffness_coeffs_given or bool(mass_terms)
         for coeff, factors in mass_terms:
             diags = []
             for d, (F, U_d) in enumerate(zip(factors, U)):
@@ -1505,10 +1510,15 @@ class KroneckerSumSolver(LinearOperator):
                     diags.append(np.einsum('ij,ik,kj->j', U_d, F, U_d))
             local_diags = [g[s:e+1] for g, s, e in zip(diags, V.starts, V.ends)]
             Lam = Lam + coeff * np.asarray(reduce(np.multiply.outer, local_diags)).reshape(local_shape)
-            term_max += abs(coeff) * np.prod([np.abs(g).max() for g in diags])
 
-        # pseudo-inverse: skip (numerically) vanishing eigenvalues
-        lam_max = max(abs(a) * abs(l).max() for a, l in zip(stiffness_coeffs, lam)) * V.ndim + abs(sigma) + term_max
+        # pseudo-inverse: skip (numerically) vanishing eigenvalues, relative to max|Lambda|
+        if generalized:
+            # signed terms may cancel: maximum of the assembled diagonal (over all processes)
+            lam_max = float(np.abs(Lam).max()) if Lam.size else 0.0
+            if V.parallel:
+                lam_max = max(V.cart.comm.allgather(lam_max))
+        else:
+            lam_max = max(abs(l).max() for l in lam) * V.ndim + abs(sigma)
         inv_Lam = np.zeros_like(Lam)
         nonzero = np.abs(Lam) > rtol * lam_max
         inv_Lam[nonzero] = 1.0 / Lam[nonzero]
