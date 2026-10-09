@@ -1373,20 +1373,28 @@ class KroneckerSumSolver(LinearOperator):
 
     .. math::
 
-        A = \sum_{d=1}^n M_1 \otimes \dots \otimes M_{d-1} \otimes S_d \otimes M_{d+1} \otimes \dots \otimes M_n
-            + \sigma \, M_1 \otimes \dots \otimes M_n \,,
+        A = \sum_{d=1}^n a_d \, M_1 \otimes \dots \otimes M_{d-1} \otimes S_d \otimes M_{d+1} \otimes \dots \otimes M_n
+            + \sigma \, M_1 \otimes \dots \otimes M_n
+            + \sum_t c_t \, F_{t,1} \otimes \dots \otimes F_{t,n} \,,
 
     with symmetric 1d matrices $S_d$ and symmetric positive definite 1d matrices $M_d$
-    (e.g. stiffness and mass matrices of a Laplacian on a tensor-product grid).
+    (e.g. stiffness and mass matrices of a Laplacian on a tensor-product grid), coefficients
+    $a_d$ (default 1) and optional additional terms with symmetric 1d factors $F_{t,d}$.
 
     In each direction, the generalized eigenproblem $S_d U_d = M_d U_d \Lambda_d$ is solved,
     with $U_d^T M_d U_d = I$. Then $U^T A U = \Lambda$ with $U = U_1 \otimes \dots \otimes U_n$
-    and the diagonal $\Lambda = \Lambda_1 \oplus \dots \oplus \Lambda_n + \sigma$ (entries
-    $\lambda_{1,i_1} + \dots + \lambda_{n,i_n} + \sigma$), hence
+    and the diagonal $\Lambda = a_1 \Lambda_1 \oplus \dots \oplus a_n \Lambda_n + \sigma + \sum_t c_t \,
+    D_{t,1} \otimes \dots \otimes D_{t,n}$ with $D_{t,d} = \mathrm{diag}(U_d^T F_{t,d} U_d)$, hence
 
     .. math::
 
         A^{-1} = U \, \Lambda^{-1} \, U^T \,.
+
+    This is exact if the $U_d$ diagonalize the $F_{t,d}$, e.g. for $F_{t,d} = M_d$, or for
+    $F_{t,d} = c_d c_d^T$ with $c_d = M_d \mathbb 1$ when the constants are a (simple) eigenvector,
+    i.e. $S_d \mathbb 1 = 0$ (a projection removing the mean in a periodic direction). Otherwise
+    the additional terms are replaced by their diagonal in the eigenbasis (an approximation).
+    The stiffness $S_d$ defines the eigenbasis also for $a_d = 0$.
 
     The dense matrices $U_d^T$ and $U_d$ are applied with KroneckerLinearSolver (also along
     distributed axes), $\Lambda^{-1}$ locally. Entries of $\Lambda$ that vanish (relative to its
@@ -1409,6 +1417,13 @@ class KroneckerSumSolver(LinearOperator):
 
     rtol : float
         Entries of $\Lambda$ with ``|lambda| <= rtol * max|Lambda|`` are treated as zero (pseudo-inverse).
+
+    stiffness_coeffs : sequence of float, optional
+        Coefficients $a_d$ of the stiffness terms (default 1).
+
+    mass_terms : sequence of (float, sequence of array | None), optional
+        Additional terms $c_t \, F_{t,1} \otimes \dots \otimes F_{t,n}$ as pairs ``(c_t, factors)``
+        with dense global 1d matrices $F_{t,d}$; None stands for $M_d$.
     """
 
     class _DenseApply(LinearSolver):
@@ -1437,12 +1452,21 @@ class KroneckerSumSolver(LinearOperator):
                  stiffness: Sequence,
                  mass: Sequence,
                  sigma: float = 0.0,
-                 rtol: float = 1e-12):
+                 rtol: float = 1e-12,
+                 *,
+                 stiffness_coeffs: Sequence[float] | None = None,
+                 mass_terms: Sequence[tuple] | None = None):
 
         from scipy.linalg import eigh  # deferred: scipy.linalg is slow to import
 
         assert isinstance(V, StencilVectorSpace)
         assert len(stiffness) == len(mass) == V.ndim
+        if stiffness_coeffs is None:
+            stiffness_coeffs = [1.0] * V.ndim
+        assert len(stiffness_coeffs) == V.ndim
+        mass_terms = list(mass_terms or [])
+        for coeff, factors in mass_terms:
+            assert len(factors) == V.ndim, 'Each mass term needs one factor (or None) per direction.'
 
         U = []
         lam = []
@@ -1463,12 +1487,28 @@ class KroneckerSumSolver(LinearOperator):
                 lam.append(l_d)
 
         # eigenvalues of A on the rows owned by this process
-        local_lam = [l[s:e+1] for l, s, e in zip(lam, V.starts, V.ends)]
+        local_shape = tuple(e - s + 1 for s, e in zip(V.starts, V.ends))
+        local_lam = [a * l[s:e+1] for a, l, s, e in zip(stiffness_coeffs, lam, V.starts, V.ends)]
         Lam = reduce(np.add.outer, local_lam) + sigma if V.ndim > 1 else local_lam[0] + sigma
-        Lam = np.asarray(Lam).reshape(tuple(e - s + 1 for s, e in zip(V.starts, V.ends)))
+        Lam = np.asarray(Lam).reshape(local_shape)
+
+        # additional terms: their diagonal in the eigenbasis, diag(U_d^T F U_d) (1 for F = M_d)
+        term_max = 0.0
+        for coeff, factors in mass_terms:
+            diags = []
+            for d, (F, U_d) in enumerate(zip(factors, U)):
+                if F is None:
+                    diags.append(np.ones(V.npts[d]))
+                else:
+                    F = np.asarray(xp.to_numpy(xp.asarray(F)), dtype=float)
+                    assert F.shape == (V.npts[d], V.npts[d]), f'Factor of direction {d} has shape {F.shape}.'
+                    diags.append(np.einsum('ij,ik,kj->j', U_d, F, U_d))
+            local_diags = [g[s:e+1] for g, s, e in zip(diags, V.starts, V.ends)]
+            Lam = Lam + coeff * np.asarray(reduce(np.multiply.outer, local_diags)).reshape(local_shape)
+            term_max += abs(coeff) * np.prod([np.abs(g).max() for g in diags])
 
         # pseudo-inverse: skip (numerically) vanishing eigenvalues
-        lam_max = max(abs(l).max() for l in lam) * V.ndim + abs(sigma)
+        lam_max = max(abs(a) * abs(l).max() for a, l in zip(stiffness_coeffs, lam)) * V.ndim + abs(sigma) + term_max
         inv_Lam = np.zeros_like(Lam)
         nonzero = np.abs(Lam) > rtol * lam_max
         inv_Lam[nonzero] = 1.0 / Lam[nonzero]
