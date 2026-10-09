@@ -475,6 +475,71 @@ def test_kron_sum_solver_par(sigma, with_none):
     check_sum_solver(MPI.COMM_WORLD, sigma, with_none)
 
 
+def check_sum_solver_terms(comm, sigma):
+    """Stiffness coefficients (one of them zero) and a term removing the mean in the periodic
+    directions 0 and 2: exact, since the constants are eigenvectors there."""
+    npts, periods = [6, 7, 8], [True, False, True]
+    W = make_space(comm, npts, [2, 2, 3], periods)
+    S, M = zip(*(laplace_1d(n, P, seed=d) for d, (n, P) in enumerate(zip(npts, periods))))
+    coeffs = [1.0, 0.5, 0.0]
+
+    def mean_projection(d):
+        c = M[d] @ np.ones(npts[d])
+        return np.outer(c, c) / c.sum()
+
+    factors = [mean_projection(0), None, mean_projection(2)]
+
+    def kron_term(d):
+        return reduce(np.kron, [M[e] if e != d else S[d] for e in range(3)])
+
+    A = sum(a * kron_term(d) for d, a in enumerate(coeffs)) + sigma * reduce(np.kron, M)
+    A = A - sigma * reduce(np.kron, [M[d] if f is None else f for d, f in enumerate(factors)])
+    solver = KroneckerSumSolver(W, S, M, sigma=sigma, stiffness_coeffs=coeffs, mass_terms=[(-sigma, factors)])
+
+    # A is singular (e.g. the constants): pseudo-inverse, exact for right-hand sides in the range of A
+    bglob = A @ np.random.default_rng(6).random(A.shape[0])
+    x = solver.dot(StencilVector_from(W, bglob))
+    # relative to the largest entry (entries close to zero next to large ones)
+    assert np.abs(A @ local_to_global(W, x) - bglob).max() < 1e-12 * np.abs(bglob).max()
+
+
+def check_sum_solver_cancellation(comm, eps):
+    """sigma = 1 and a term (eps - 1) * M_1 x M_2 x M_3 cancel to A = eps * M_1 x M_2 x M_3: the
+    pseudo-inverse cutoff relative to the assembled diagonal keeps all eigenvalues."""
+    npts, periods = [6, 7, 8], [True, False, True]
+    W = make_space(comm, npts, [2, 2, 3], periods)
+    _, M = zip(*(laplace_1d(n, P, seed=d) for d, (n, P) in enumerate(zip(npts, periods))))
+    A = eps * reduce(np.kron, M)
+    solver = KroneckerSumSolver(W, [None] * 3, M, sigma=1.0, mass_terms=[(eps - 1.0, [None] * 3)])
+
+    bglob = A @ np.random.default_rng(7).random(A.shape[0])
+    x = solver.dot(StencilVector_from(W, bglob))
+    # 1 + (eps - 1) carries the round-off of 1, i.e. a relative error ~ 1e-16 / eps; with discarded
+    # eigenvalues (cutoff relative to the sum of the terms) x would vanish and the residual be |b|
+    tol = 100 * np.finfo(float).eps / eps
+    assert np.abs(A @ local_to_global(W, x) - bglob).max() < tol * np.abs(bglob).max()
+
+
+@pytest.mark.parametrize('eps', [1e-6, 1e-13])
+def test_kron_sum_solver_cancellation_ser(eps):
+    check_sum_solver_cancellation(None, eps)
+
+@pytest.mark.mpi
+@pytest.mark.parametrize('eps', [1e-6, 1e-13])
+def test_kron_sum_solver_cancellation_par(eps):
+    check_sum_solver_cancellation(MPI.COMM_WORLD, eps)
+
+
+@pytest.mark.parametrize('sigma', [0.7, 3.0])
+def test_kron_sum_solver_terms_ser(sigma):
+    check_sum_solver_terms(None, sigma)
+
+@pytest.mark.mpi
+@pytest.mark.parametrize('sigma', [0.7, 3.0])
+def test_kron_sum_solver_terms_par(sigma):
+    check_sum_solver_terms(MPI.COMM_WORLD, sigma)
+
+
 #===============================================================================
 # Row layout of the factors, duplicate entries of periodic factors
 #===============================================================================
