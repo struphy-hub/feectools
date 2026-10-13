@@ -277,7 +277,7 @@ def extract_stencil_mats(mats):
         if isinstance(M, (StencilInterfaceMatrix, StencilMatrix)):
             new_mats.append(M)
         elif isinstance(M, ComposedLinearOperator):
-            new_mats += [i for i in M.multiplicants if isinstance(i, (StencilInterfaceMatrix, StencilMatrix))]
+            new_mats += [i for i in M.multiplicands if isinstance(i, (StencilInterfaceMatrix, StencilMatrix))]
     return new_mats
 
 #==============================================================================
