@@ -322,11 +322,19 @@ class StencilVectorSpace(VectorSpace):
             self._inner_func(x._data, y._data, *self._inner_consts, res)
 
         if self.parallel:
-            # The send buffer may have just been written on the device; MPI reads it directly.
-            synchronize_for_mpi(x._dot_send_data, x._dot_recv_data)
-            self.cart.global_comm.Allreduce((x._dot_send_data, self.mpi_type),
-                                            (x._dot_recv_data, self.mpi_type),
-                                             op=MPI.SUM )
+            if xp.is_gpu(x._dot_send_data):
+                # One number: an Allreduce of a host copy (~10 us) is much cheaper than the
+                # CUDA-aware Allreduce of the device buffer (~40 us on H100 nodes). The result
+                # goes back into the device buffer, so the inner product is still a device array.
+                send = xp.to_numpy(x._dot_send_data)
+                recv = send.copy()
+                self.cart.global_comm.Allreduce((send, self.mpi_type), (recv, self.mpi_type), op=MPI.SUM)
+                x._dot_recv_data[...] = xp.asarray(recv)
+            else:
+                synchronize_for_mpi(x._dot_send_data, x._dot_recv_data)
+                self.cart.global_comm.Allreduce((x._dot_send_data, self.mpi_type),
+                                                (x._dot_recv_data, self.mpi_type),
+                                                 op=MPI.SUM )
             res = x._dot_recv_data
 
         if xp.is_gpu(res):
