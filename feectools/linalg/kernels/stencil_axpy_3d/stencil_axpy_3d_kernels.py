@@ -22,6 +22,7 @@ def stencil_axpy_3d(alpha: 'T', x: 'T[:,:,:]', y: 'T[:,:,:]'):
         Data of the vectors.
     """
     n0, n1, n2 = x.shape
+    #$ omp parallel for schedule(static) private(i1, i2)
     for i0 in range(n0):
         for i1 in range(n1):
             for i2 in range(n2):

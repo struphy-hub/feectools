@@ -27,6 +27,7 @@ def stencil_transpose_2d(mat: 'float[:, :, :, :]',
     q1 = (mat.shape[2] - 1) // 2  # pads of mat
     q2 = (mat.shape[3] - 1) // 2
 
+    #$ omp parallel for schedule(static) private(i1_loc, nd1, i2, i2_loc, nd2, d1, j1, j1_loc, d2, j2, j2_loc)
     for i1 in range(s_out[0], e_out[0] + 1):  # global row indices of matT = global column indices of mat
         i1_loc = i1 - s_out[0]  # local row indices of matT
         nd1 = n_diags1

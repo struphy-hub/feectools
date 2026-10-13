@@ -13,6 +13,8 @@ import feectools
 psydac_path = os.path.abspath(feectools.__path__[0])
 libdir = sysconfig.get_config_var("LIBDIR")
 psydac_makefile_dir = os.path.join(psydac_path, "accelerate")
+# The OpenMP flag of the last build, to rebuild when it changes
+_omp_stamp_file = os.path.join(psydac_makefile_dir, ".last_flags_openmp")
 
 def subp_run(cmd, cwd=None, check=True):
     """Call subprocess.run and print run command."""
@@ -40,11 +42,8 @@ def psydac_compile(language, compiler_family, compiler_config, omp, delete, stat
     compiler_config: str
         Path to a JSON compiler file.
 
-    omp_pic : bool
-        Whether to compile PIC kernels with OpenMP (default=False).
-
-    omp_feec : bool
-        WHether to compile FEEC kernels with OpenMP (default=False).
+    omp : bool
+        Whether to compile the kernels with OpenMP (default=False).
 
     delete : bool
         If True, deletes generated Fortran/C files and .so files (default=False).
@@ -105,10 +104,18 @@ def psydac_compile(language, compiler_family, compiler_config, omp, delete, stat
             return
 
     # pyccel flags
-    # TODO: Compile psydac with OpenMP
     flag_omp = ""
     if omp:
-        flag_omp = "--openmp"
+        flag_omp = " --openmp"
+
+    # Make tracks source timestamps, not compiler flags. Switching OpenMP
+    # must rebuild even when the kernel sources have not changed.
+    try:
+        with open(_omp_stamp_file) as f:
+            last_flag_omp = f.read()
+    except FileNotFoundError:
+        last_flag_omp = ""
+    rebuild_openmp = last_flag_omp.strip() != flag_omp.strip()
     sources = " ".join(sources)
     flags = "--language=" + language
 
@@ -125,8 +132,12 @@ def psydac_compile(language, compiler_family, compiler_config, omp, delete, stat
         "flags=" + flags,
         "flags_openmp=" + flag_omp,
     ]
+    if rebuild_openmp:
+        cmd.insert(1, "-B")
     print(os.path.join(libdir, "accelerate"))
-    subp_run(cmd, cwd=psydac_makefile_dir),
+    subp_run(cmd, cwd=psydac_makefile_dir)
+    with open(_omp_stamp_file, "w") as f:
+        f.write(flag_omp)
 
 
 def cleanup_files(root_path: str):
@@ -149,6 +160,8 @@ def cleanup_files(root_path: str):
         "sources=" + sources,
     ]
     subp_run(cmd, cwd=psydac_makefile_dir)
+    if os.path.isfile(_omp_stamp_file):
+        os.remove(_omp_stamp_file)
 
 
 def main():

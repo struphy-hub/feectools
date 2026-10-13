@@ -27,6 +27,7 @@ def stencil_dot_2d(mat: 'float[:, :, :, :]',
     off1 = p_in[0] - (n_diags1 - 1) // 2 - s_in[0]
     off2 = p_in[1] - (n_diags2 - 1) // 2 - s_in[1]
 
+    #$ omp parallel for schedule(static) private(i1_loc, nd1, i2, i2_loc, nd2, val, d1, d2)
     for i1 in range(s_out[0], e_out[0] + 1):  # global row indices
         i1_loc = i1 - s_out[0]  # local row indices
         nd1 = n_diags1
