@@ -101,6 +101,7 @@ def evaluate_dofs_2d_vec(f1 : 'float[:,:]', f2 : 'float[:,:]', f1_pts : 'float[:
 def evaluate_dofs_3d_0form(f : 'float[:,:,:]', f_pts : 'float[:,:,:]'):
     
     n1, n2, n3 = f.shape
+    #$ omp parallel for collapse(2) schedule(static) private(i3)
     for i1 in range(n1):
         for i2 in range(n2):
             for i3 in range(n3):
@@ -114,6 +115,7 @@ def evaluate_dofs_3d_1form(quad_w1 : 'float[:,:]', quad_w2 : 'float[:,:]', quad_
     k3 = quad_w3.shape[1]
 
     n1, n2, n3 = f1.shape
+    #$ omp parallel for collapse(2) schedule(static) private(i3, g1, g2, g3)
     for i1 in range(n1):
         for i2 in range(n2):
             for i3 in range(n3):
@@ -122,6 +124,7 @@ def evaluate_dofs_3d_1form(quad_w1 : 'float[:,:]', quad_w2 : 'float[:,:]', quad_
                     f1[i1, i2, i3] += quad_w1[i1, g1] * f1_pts[i1*k1 + g1, i2, i3]
 
     n1, n2, n3 = f2.shape
+    #$ omp parallel for collapse(2) schedule(static) private(i3, g1, g2, g3)
     for i1 in range(n1):
         for i2 in range(n2):
             for i3 in range(n3):
@@ -130,6 +133,7 @@ def evaluate_dofs_3d_1form(quad_w1 : 'float[:,:]', quad_w2 : 'float[:,:]', quad_
                     f2[i1, i2, i3] += quad_w2[i2, g2] * f2_pts[i1, i2*k2 + g2, i3]
 
     n1, n2, n3 = f3.shape
+    #$ omp parallel for collapse(2) schedule(static) private(i3, g1, g2, g3)
     for i1 in range(n1):
         for i2 in range(n2):
             for i3 in range(n3):
@@ -145,6 +149,7 @@ def evaluate_dofs_3d_2form(quad_w1 : 'float[:,:]', quad_w2 : 'float[:,:]', quad_
     k3 = quad_w3.shape[1]
 
     n1, n2, n3 = f1.shape
+    #$ omp parallel for collapse(2) schedule(static) private(i3, g1, g2, g3)
     for i1 in range(n1):
         for i2 in range(n2):
             for i3 in range(n3):
@@ -154,6 +159,7 @@ def evaluate_dofs_3d_2form(quad_w1 : 'float[:,:]', quad_w2 : 'float[:,:]', quad_
                         f1[i1, i2, i3] += quad_w2[i2, g2] * quad_w3[i3, g3] * f1_pts[i1, i2*k2 + g2, i3*k3 + g3]
 
     n1, n2, n3 = f2.shape
+    #$ omp parallel for collapse(2) schedule(static) private(i3, g1, g2, g3)
     for i1 in range(n1):
         for i2 in range(n2):
             for i3 in range(n3):
@@ -163,6 +169,7 @@ def evaluate_dofs_3d_2form(quad_w1 : 'float[:,:]', quad_w2 : 'float[:,:]', quad_
                         f2[i1, i2, i3] += quad_w1[i1, g1] * quad_w3[i3, g3] * f2_pts[i1*k1 + g1, i2, i3*k3 + g3]
 
     n1, n2, n3 = f3.shape
+    #$ omp parallel for collapse(2) schedule(static) private(i3, g1, g2, g3)
     for i1 in range(n1):
         for i2 in range(n2):
             for i3 in range(n3):
@@ -179,6 +186,7 @@ def evaluate_dofs_3d_3form(quad_w1 : 'float[:,:]', quad_w2 : 'float[:,:]', quad_
     k3 = quad_w3.shape[1]
 
     n1, n2, n3 = f.shape
+    #$ omp parallel for collapse(2) schedule(static) private(i3, g1, g2, g3)
     for i1 in range(n1):
         for i2 in range(n2):
             for i3 in range(n3):
@@ -192,18 +200,21 @@ def evaluate_dofs_3d_3form(quad_w1 : 'float[:,:]', quad_w2 : 'float[:,:]', quad_
 def evaluate_dofs_3d_vec(f1 : 'float[:,:,:]', f2 : 'float[:,:,:]', f3 : 'float[:,:,:]', f1_pts : 'float[:,:,:]', f2_pts : 'float[:,:,:]', f3_pts : 'float[:,:,:]'):
     
     n1, n2, n3 = f1.shape
+    #$ omp parallel for collapse(2) schedule(static) private(i3)
     for i1 in range(n1):
         for i2 in range(n2):
             for i3 in range(n3):
                 f1[i1, i2, i3] = f1_pts[i1, i2, i3]
                 
     n1, n2, n3 = f2.shape
+    #$ omp parallel for collapse(2) schedule(static) private(i3)
     for i1 in range(n1):
         for i2 in range(n2):
             for i3 in range(n3):
                 f2[i1, i2, i3] = f2_pts[i1, i2, i3]
                 
     n1, n2, n3 = f3.shape
+    #$ omp parallel for collapse(2) schedule(static) private(i3)
     for i1 in range(n1):
         for i2 in range(n2):
             for i3 in range(n3):
