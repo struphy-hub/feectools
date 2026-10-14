@@ -4,6 +4,7 @@
 # for full license details.                                                 #
 #---------------------------------------------------------------------------#
 from abc import ABC, abstractmethod
+from functools import reduce
 
 import cunumpy as xp
 import numpy as np
@@ -48,18 +49,27 @@ class _DeviceRegionExchange:
 
         me = comm.Get_rank()
         self._comm = comm
-        flat = np.arange(int(np.prod(shape)), dtype=np.int64).reshape(shape)
+        # C-order element strides: the flat indices of a region are built from per-axis ranges, so the work and
+        # memory scale with the region, not with the whole array (a stencil matrix block has ~10^8 entries)
+        strides = [1] * len(shape)
+        for axis in range(len(shape) - 2, -1, -1):
+            strides[axis] = strides[axis + 1] * int(shape[axis + 1])
+
+        def flat(idx):
+            """Flat (C-order) indices of the region `idx` of the array, in C order of the region."""
+            axes = [np.arange(*sl.indices(int(n)), dtype=np.int64) * st for sl, n, st in zip(idx, shape, strides)]
+            return reduce(np.add, np.ix_(*axes)).ravel()
 
         local_send, local_recv, sends, recvs = [], [], {}, {}
         for send_idx, dest, recv_idx, source in transfers:
             if dest == me and source == me:
-                local_send.append(flat[send_idx].ravel())
-                local_recv.append(flat[recv_idx].ravel())
+                local_send.append(flat(send_idx))
+                local_recv.append(flat(recv_idx))
                 continue
             if dest != MPI.PROC_NULL:
-                sends.setdefault(dest, []).append(flat[send_idx].ravel())
+                sends.setdefault(dest, []).append(flat(send_idx))
             if source != MPI.PROC_NULL:
-                recvs.setdefault(source, []).append(flat[recv_idx].ravel())
+                recvs.setdefault(source, []).append(flat(recv_idx))
 
         def layout(groups, local):
             """Flat indices of [message to/from each rank..., local regions], and each message's slice."""
