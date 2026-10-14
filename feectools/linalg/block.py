@@ -682,7 +682,9 @@ class BlockLinearOperator(LinearOperator):
                 assert isinstance(out, BlockVector)
 
             assert out.space is self.codomain
-            out *= 0.0
+            # `_dot` writes every block row of `out` itself (see there); other kernels add to it
+            if self._func is not self._dot:
+                out *= 0.0
         else:
             out = self.codomain.zeros()
 
@@ -697,16 +699,33 @@ class BlockLinearOperator(LinearOperator):
     #...
     @staticmethod
     def _dot(blocks, v, out, n_rows, n_cols, inc):
+        # The first block of each block row writes its product straight into that row of `out`; further blocks of
+        # the row go through `inc` and are added. A row with a single block (e.g. the diagonal blocks of a mass
+        # matrix on a Cuboid, the gradient) thus costs no zeroing pass and no addition; rows without any block are
+        # set to zero.
 
         if n_rows == 1:
+            written = False
             for (_, j), L0j in blocks.items():
-                out += L0j.dot(v[j], out=inc)
-        elif n_cols == 1:
-            for (i, _), Li0 in blocks.items():
-                out[i] += Li0.dot(v, out=inc[i])
+                if written:
+                    out += L0j.dot(v[j], out=inc)
+                else:
+                    L0j.dot(v[j], out=out)
+                    written = True
+            if not written:
+                out *= 0.0
         else:
+            written = set()
             for (i, j), Lij in blocks.items():
-                out[i] += Lij.dot(v[j], out=inc[i])
+                vj = v if n_cols == 1 else v[j]
+                if i in written:
+                    out[i] += Lij.dot(vj, out=inc[i])
+                else:
+                    Lij.dot(vj, out=out[i])
+                    written.add(i)
+            for i in range(n_rows):
+                if i not in written:
+                    out[i] *= 0.0
 
     # ...
     def transpose(self, conjugate=False, out=None):
