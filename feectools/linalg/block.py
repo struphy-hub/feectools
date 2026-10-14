@@ -126,6 +126,19 @@ class BlockVectorSpace(VectorSpace):
         assert y.space is self
         return sum(Vi.inner(xi, yi) for Vi, xi, yi in zip(self.spaces, x.blocks, y.blocks))
 
+    def inner_local(self, x, y):
+        """The contribution of this process to :meth:`inner` (sum of the blocks', not reduced)."""
+        assert isinstance(x, BlockVector)
+        assert isinstance(y, BlockVector)
+        assert x.space is self
+        assert y.space is self
+        return sum(Vi.inner_local(xi, yi) for Vi, xi, yi in zip(self.spaces, x.blocks, y.blocks))
+
+    @property
+    def inner_comm(self):
+        """The communicator :meth:`inner` reduces over: that of the blocks (None if not parallel)."""
+        return self.spaces[0].inner_comm
+
     #...
     def axpy(self, a, x, y):
         """
@@ -399,8 +412,16 @@ class BlockVector(Vector):
 
         req = self.start_update_interface_ghost_regions()
 
-        for vi in self.blocks:
-            vi.update_ghost_regions()
+        if all(hasattr(vi, '_start_update_ghost_regions') and xp.is_gpu(vi._data) for vi in self.blocks):
+            # device data: the exchanges of all blocks are in flight together, with one wait each at the
+            # end, instead of one complete exchange (and its fixed costs) after the other
+            for vi in self.blocks:
+                vi._start_update_ghost_regions()
+            for vi in self.blocks:
+                vi._end_update_ghost_regions()
+        else:
+            for vi in self.blocks:
+                vi.update_ghost_regions()
 
         self.end_update_interface_ghost_regions(req)
 

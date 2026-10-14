@@ -8,7 +8,7 @@ from functools import reduce
 
 import cunumpy as xp
 import numpy as np
-from cunumpy.mpi import exchange, get_mpi_cuda_aware
+from cunumpy.mpi import exchange, get_mpi_cuda_aware, synchronize_for_mpi
 from maybempi import MPI
 
 
@@ -91,8 +91,15 @@ class _DeviceRegionExchange:
         self._sends = [(self._send_buf[sl], rank) for rank, sl in send_slices]
         self._recvs = [(self._recv_buf[sl], rank) for rank, sl in recv_slices]
 
-    def __call__(self, array):
+    def start(self, array):
+        """Gather the regions to send and post the messages; returns the requests for :meth:`finish`.
 
+        With CUDA-aware MPI the device buffers go to MPI directly after one stream synchronization
+        (which also orders the receives after the previous scatter from the receive buffer), and
+        the transfers proceed until :meth:`finish`: several exchanges (e.g. the components of a
+        block vector) can be in flight at once. Otherwise the buffers are staged through the host
+        and the exchange completes here.
+        """
         assert array.flags.c_contiguous, "device ghost exchange needs a C-contiguous array"
         values = array.reshape(-1)
 
@@ -100,22 +107,40 @@ class _DeviceRegionExchange:
         if self._send_index.size:
             xp.take(values, self._send_index, out=self._send_buf)
 
-        if self._sends or self._recvs:
-            # device buffers straight to MPI if it is CUDA-aware (assumed when unknown, as for the
-            # datatype exchange this replaces), staged through the host otherwise
-            cuda_aware = get_mpi_cuda_aware()
+        if not (self._sends or self._recvs):
+            return []
+
+        # device buffers straight to MPI if it is CUDA-aware (assumed when unknown, as for the
+        # datatype exchange this replaces), staged through the host otherwise
+        cuda_aware = get_mpi_cuda_aware()
+        if cuda_aware is False:
             exchange(
                 self._comm,
                 sends=[(buf, rank, self.TAG) for buf, rank in self._sends],
                 receives=[(buf, rank, self.TAG) for buf, rank in self._recvs],
-                cuda_aware=True if cuda_aware is None else cuda_aware,
+                cuda_aware=False,
             )
+            return []
 
+        synchronize_for_mpi(self._send_buf)
+        requests = [self._comm.Irecv(buf, source=rank, tag=self.TAG) for buf, rank in self._recvs]
+        requests += [self._comm.Isend(buf, dest=rank, tag=self.TAG) for buf, rank in self._sends]
+        return requests
+
+    def finish(self, array, requests):
+        """Wait for the messages of :meth:`start` and scatter everything received (and the local copies)."""
+        if requests:
+            MPI.Request.Waitall(requests)
+
+        values = array.reshape(-1)
         # scatter everything received (and the local copies) with one kernel
         if self._recv_index.size:
             if self._local_recv.stop > self._local_recv.start:
                 self._recv_buf[self._local_recv] = self._send_buf[self._local_send]
             values[self._recv_index] = self._recv_buf
+
+    def __call__(self, array):
+        self.finish(array, self.start(array))
 
 
 #===============================================================================
@@ -201,14 +226,18 @@ class CartDataExchanger(ABC):
         idx += [slice(0, int(n)) for n in array_shape[len(idx):]]
         return tuple(idx)
 
-    def _device_exchange(self, key, array, comm, transfers):
-        """Run the `_DeviceRegionExchange` of `transfers` (built by the callable on first use) on `array`."""
+    def _device_plan(self, key, array, comm, transfers):
+        """The `_DeviceRegionExchange` of `transfers` for `array` (built by the callable on first use)."""
         plans = self.__dict__.setdefault('_device_plans', {})
         plan_key = (key, tuple(array.shape), np.dtype(array.dtype))
         plan = plans.get(plan_key)
         if plan is None:
             plan = plans[plan_key] = _DeviceRegionExchange(comm, transfers(), array.shape, array.dtype)
-        plan(array)
+        return plan
+
+    def _device_exchange(self, key, array, comm, transfers):
+        """Run the `_DeviceRegionExchange` of `transfers` (built by the callable on first use) on `array`."""
+        self._device_plan(key, array, comm, transfers)(array)
 
     def _device_update_ghost_regions_along(self, array, direction):
         """Ghost regions of `direction` (both sides) from the neighbours, as the blocking exchange."""

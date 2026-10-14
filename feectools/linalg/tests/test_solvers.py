@@ -59,7 +59,7 @@ def define_data(n, p, matrix_data, dtype=float):
 @pytest.mark.parametrize( 'n', [5, 10, 13] )
 @pytest.mark.parametrize('p', [2, 3])
 @pytest.mark.parametrize('dtype', [float])
-@pytest.mark.parametrize('solver', ['cg', 'pcg', 'bicg', 'bicgstab', 'pbicgstab', 'minres', 'lsmr', 'gmres'])
+@pytest.mark.parametrize('solver', ['cg', 'pcg', 'pcg_sr', 'bicg', 'bicgstab', 'pbicgstab', 'minres', 'lsmr', 'gmres'])
 
 def test_solver_tridiagonal(n, p, dtype, solver, verbose=False):
 
@@ -82,7 +82,7 @@ def test_solver_tridiagonal(n, p, dtype, solver, verbose=False):
         else:
             diagonals = [-7,-1,-3]
 
-    if solver in ['cg', 'pcg', 'minres']:
+    if solver in ['cg', 'pcg', 'pcg_sr', 'minres']:
         # pcg runs with Jacobi preconditioner
         V, A, xe = define_data_hermitian(n, p, dtype=dtype)
         if solver == 'minres' and dtype == complex:
@@ -106,7 +106,7 @@ def test_solver_tridiagonal(n, p, dtype, solver, verbose=False):
         print()
 
     #Create the solvers
-    if solver in ['pcg', 'pbicgstab']:
+    if solver in ['pcg', 'pcg_sr', 'pbicgstab']:
         pc = A.diagonal(inverse=True)
         solv = inverse(A, solver, pc=pc, tol=1e-13, verbose=verbose, recycle=True)
     else:
@@ -144,7 +144,7 @@ def test_solver_tridiagonal(n, p, dtype, solver, verbose=False):
     assert xp.array_equal(xh.toarray(), solvh_x0.toarray())
     assert xh is not solvh_x0
 
-    if solver != 'pcg':
+    if solver not in ['pcg', 'pcg_sr']:
         # PCG only works with operators with diagonal
         xc = solv2 @ be2
         solv2_x0 = solv2._options["x0"]
@@ -157,7 +157,7 @@ def test_solver_tridiagonal(n, p, dtype, solver, verbose=False):
     b2 = A @ x2
     bt = A.T @ xt
     bh = A.H @ xh
-    if solver != 'pcg':
+    if solver not in ['pcg', 'pcg_sr']:
         bc = A @ A @ xc
 
     err = b - be
@@ -169,7 +169,7 @@ def test_solver_tridiagonal(n, p, dtype, solver, verbose=False):
     errh = bh - beh
     errh_norm = xp.linalg.norm( errh.toarray() )
 
-    if solver != 'pcg': 
+    if solver not in ['pcg', 'pcg_sr']: 
         errc = bc - be2
         errc_norm = xp.linalg.norm( errc.toarray() )
 
@@ -202,7 +202,7 @@ def test_solver_tridiagonal(n, p, dtype, solver, verbose=False):
         assert err2_norm < tol
         assert errt_norm < tol
         assert errh_norm < tol
-        assert solver == 'pcg' or errc_norm < tol
+        assert solver in ['pcg', 'pcg_sr'] or errc_norm < tol
 
 # ===============================================================================
 # SCRIPT FUNCTIONALITY

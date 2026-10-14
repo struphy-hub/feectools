@@ -76,7 +76,7 @@ class NonBlockingCartDataExchanger(CartDataExchanger):
     def prepare_communications(self, u):
 
         # Device arrays need no persistent requests: their ghost regions are exchanged
-        # through contiguous buffers (`_device_update_ghost_regions`)
+        # through contiguous buffers (`_device_ghost_plan`)
         if xp.is_gpu(u):
             return ()
 
@@ -106,7 +106,11 @@ class NonBlockingCartDataExchanger(CartDataExchanger):
 
     def start_update_ghost_regions(self, array, requests ):
         if xp.is_gpu(array):
-            self._device_update_ghost_regions(array)
+            # started here, finished in end_update_ghost_regions: several vectors (e.g. the
+            # components of a block vector) can exchange at the same time
+            plan = self._device_ghost_plan(array)
+            pending = self.__dict__.setdefault('_device_pending', {})
+            pending[id(array)] = (plan, plan.start(array))
             return
         # The persistent requests read/write `array` directly; on a device
         # backend the kernels that produced it must have finished first.
@@ -115,12 +119,14 @@ class NonBlockingCartDataExchanger(CartDataExchanger):
 
     def end_update_ghost_regions(self, array, requests):
         if xp.is_gpu(array):
+            plan, device_requests = self._device_pending.pop(id(array))
+            plan.finish(array, device_requests)
             return
         MPI.Prequest.Waitall  ( requests )
 
     # ...
-    def _device_update_ghost_regions(self, array):
-        """All ghost regions (every shift, as the persistent requests) of a device array."""
+    def _device_ghost_plan(self, array):
+        """The exchange of all ghost regions (every shift, as the persistent requests) of a device array."""
         cart = self._cart
 
         def transfers():
@@ -133,7 +139,7 @@ class NonBlockingCartDataExchanger(CartDataExchanger):
                             self._region(info['recv_starts'], info['buf_shape'], array.shape), info['rank_source']))
             return out
 
-        self._device_exchange('ghost', array, cart._comm_cart, transfers)
+        return self._device_plan('ghost', array, cart._comm_cart, transfers)
 
     # ...
     def start_exchange_assembly_data( self, array ):

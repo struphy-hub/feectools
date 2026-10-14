@@ -17,6 +17,7 @@ from scipy.sparse import coo_matrix, diags as sp_diags
 
 from maybempi import MPI
 from feectools.linalg.basic  import VectorSpace, Vector, LinearOperator
+from feectools.utilities.cached_launch import CachedLaunch
 from feectools.linalg.memory import stencil_matrix_memory
 from feectools.ddm.cart      import find_mpi_type, CartDecomposition, InterfaceCartDecomposition
 from feectools.ddm.utilities import get_data_exchanger
@@ -210,14 +211,14 @@ class StencilVectorSpace(VectorSpace):
 
         # Select kernel for AXPY operation
         if self._ndim in [1, 2, 3]:
-            self._axpy_func = stencil_kernels['axpy'][self._ndim]
+            self._axpy_func = CachedLaunch(stencil_kernels['axpy'][self._ndim])
         else:
             self._axpy_func = self._axpy_python
             self._axpy_work = self.zeros()  # work array
 
         # Select kernel for inner product
         if self._ndim in [1, 2, 3]:
-            self._inner_func = stencil_kernels['inner'][self._ndim]
+            self._inner_func = CachedLaunch(stencil_kernels['inner'][self._ndim])
         else:
             self._inner_func = self._inner_python
 
@@ -343,6 +344,31 @@ class StencilVectorSpace(VectorSpace):
             return res[0].copy()
         # a NumPy scalar
         return res[0]
+
+    # ...
+    def inner_local(self, x, y):
+        """The contribution of this process to :meth:`inner` (not reduced over the processes).
+
+        A 0-d device array for device data, a NumPy scalar otherwise. Reduce the contributions
+        of several inner products with one Allreduce on :attr:`inner_comm` to save a reduction
+        (and a device synchronization) per inner product, see
+        :func:`feectools.linalg.solvers._inner_products`.
+        """
+        assert isinstance(x, StencilVector)
+        assert isinstance(y, StencilVector)
+        assert x.space is self
+        assert y.space is self
+
+        res = x._dot_send_data
+        res[0] = 0
+        if x._data.shape[0] != 0:
+            self._inner_func(x._data, y._data, *self._inner_consts, res)
+        return res[0].copy() if xp.is_gpu(res) else res[0]
+
+    @property
+    def inner_comm(self):
+        """The communicator :meth:`inner` reduces over (None if not parallel)."""
+        return self.cart.global_comm if self.parallel else None
 
     # ...
     def axpy(self, a, x, y):
@@ -517,6 +543,82 @@ class StencilVectorSpace(VectorSpace):
             space = StencilVectorSpace(cart, self.dtype)
 
             self._interfaces[axis, ext] = space
+
+#========================================================================
+_SERIAL_GHOST_SRC = r"""
+extern "C" __global__ void serial_ghost_update(double* a, const long long* dst, const long long* src, long long n)
+{
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        long long s = src[i];
+        a[dst[i]] = s >= 0 ? a[s] : 0.0;
+    }
+}
+"""
+
+
+class _SerialGhostPlan:
+    """The serial ghost update (:meth:`StencilVector._update_ghost_regions_serial`) of a device array as one kernel.
+
+    The serial update is up to ``2 * ndim`` strided copies and fills, one launch each. Applied once to an array of
+    flat indices, it gives for every ghost entry the entry its final value comes from (or -1 for zero), corners and
+    the order of the directions included; one kernel then does ``a[dst] = a[src]`` (or 0) for all ghost entries.
+    Valid only if no ghost entry is read (the source entries are all owned), which is checked.
+    """
+
+    def __init__(self, dst, src):
+        import cupy as cp
+        import numpy as np
+
+        self._dst = cp.asarray(dst)
+        self._src = cp.asarray(src)
+        self._n = np.int64(dst.size)
+        self._kernel = cp.RawKernel(_SERIAL_GHOST_SRC, "serial_ghost_update")
+        self._block = (256,)
+        self._grid = ((int(self._n) + 255) // 256,)
+
+    def __call__(self, data):
+        if self._n:
+            self._kernel(self._grid, self._block, (data, self._dst, self._src, self._n))
+
+
+def _serial_ghost_plan(space, data):
+    """The :class:`_SerialGhostPlan` of ``space`` for ``data`` (built on first use), or None if it does not apply.
+
+    Only for C-contiguous float64 device arrays; other data use the slice copies.
+    """
+    import numpy as np
+
+    if not (xp.is_gpu(data) and data.dtype == np.float64 and data.flags.c_contiguous):
+        return None
+    plans = space.__dict__.setdefault('_serial_ghost_plans', {})
+    key = tuple(data.shape)
+    if key in plans:
+        return plans[key]
+
+    # run the serial update on the flat indices (-1: set to zero)
+    idx = np.arange(int(np.prod(key)), dtype=np.int64).reshape(key)
+    for direction in range(space.ndim):
+        p = space.pads[direction] * space.shifts[direction]
+        if p == 0:
+            continue
+        front = [slice(None)] * direction
+        back = [slice(None)] * (idx.ndim - direction - 1)
+        if space.periods[direction]:
+            idx[tuple(front + [slice(-p, None)] + back)] = idx[tuple(front + [slice(p, 2*p)] + back)]
+            idx[tuple(front + [slice(None, p)] + back)] = idx[tuple(front + [slice(-2*p, -p)] + back)]
+        else:
+            idx[tuple(front + [slice(None, p)] + back)] = -1
+            idx[tuple(front + [slice(-p, None)] + back)] = -1
+
+    flat = idx.ravel()
+    dst = np.flatnonzero(flat != np.arange(flat.size))
+    src = flat[dst]
+    # every source must be an entry the update does not write, or the kernel would race
+    plan = None if np.isin(src[src >= 0], dst).any() else _SerialGhostPlan(dst, src)
+    plans[key] = plan
+    return plan
+
 
 #========================================================================
 class StencilVector(Vector):
@@ -835,15 +937,30 @@ class StencilVector(Vector):
 
         """
 
+        self._start_update_ghost_regions()
+        self._end_update_ghost_regions()
+
+    # ...
+    def _start_update_ghost_regions(self):
+        """First half of :meth:`update_ghost_regions`: start the exchange with the neighbours (if parallel)."""
+        if self.space.parallel and not self.space.cart.is_comm_null:
+            self.space._synchronizer.start_update_ghost_regions(self._data, self._requests)
+
+    # ...
+    def _end_update_ghost_regions(self):
+        """Second half of :meth:`update_ghost_regions`: finish the exchange, update the interfaces, flag in sync."""
         # Update interior ghost regions
         if self.space.parallel:
             if not self.space.cart.is_comm_null:
                 # PARALLEL CASE: fill in ghost regions with data from neighbors
-                self.space._synchronizer.start_update_ghost_regions(self._data, self._requests)
-                self.space._synchronizer.  end_update_ghost_regions(self._data, self._requests)
+                self.space._synchronizer.end_update_ghost_regions(self._data, self._requests)
         else:
             # SERIAL CASE: fill in ghost regions along periodic directions, otherwise set to zero
-            self._update_ghost_regions_serial()
+            plan = _serial_ghost_plan(self._space, self._data)
+            if plan is None:
+                self._update_ghost_regions_serial()
+            else:
+                plan(self._data)
 
         # Update interface ghost regions
         if self.space.parallel:
