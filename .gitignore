@@ -34,3 +34,6 @@ env*/
 
 # Meson lock files
 */.wraplock
+
+# OpenMP flag of the last kernel build (feectools.accelerate)
+feectools/accelerate/.last_flags_openmp

@@ -9,6 +9,8 @@ result added to ``res[0]`` instead of returned, because a CUDA kernel cannot ret
 
 from typing import TypeVar
 
+from numpy import zeros_like
+
 T = TypeVar('T', float, complex)
 
 
@@ -35,10 +37,17 @@ def stencil_inner_3d(v1: 'T[:,:,:]', v2: 'T[:,:,:]', nghost0: 'int64', nghost1: 
     """
     shape0, shape1, shape2 = v1.shape
 
-    part = v1[0, 0, 0] - v1[0, 0, 0]
+    # One partial sum per index pair (i0, i1), added in a fixed order: unlike an OpenMP reduction,
+    # the result is the same for every run and every number of threads.
+    parts = zeros_like(v1[:, :, 0])
+    #$ omp parallel for collapse(2) schedule(static) private(part, i2)
     for i0 in range(nghost0, shape0 - nghost0):
         for i1 in range(nghost1, shape1 - nghost1):
+            part = v1[0, 0, 0] - v1[0, 0, 0]
             for i2 in range(nghost2, shape2 - nghost2):
                 part += v1[i0, i1, i2].conjugate() * v2[i0, i1, i2]
+            parts[i0, i1] = part
 
-    res[0] += part
+    for i0 in range(nghost0, shape0 - nghost0):
+        for i1 in range(nghost1, shape1 - nghost1):
+            res[0] += parts[i0, i1]
