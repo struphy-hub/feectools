@@ -585,11 +585,16 @@ class _SerialGhostPlan:
 def _serial_ghost_plan(space, data):
     """The :class:`_SerialGhostPlan` of ``space`` for ``data`` (built on first use), or None if it does not apply.
 
-    Only for C-contiguous float64 device arrays; other data use the slice copies.
+    Only for C-contiguous float64 device arrays; other data use the slice copies. Also used for the data of a
+    :class:`StencilMatrix` (``space`` its codomain: the slices run over the first ``space.ndim`` axes and take the
+    others whole, as in :meth:`StencilMatrix._update_ghost_regions_serial`), up to ``2**26`` entries: the plan is
+    built from an index array of the size of the data.
     """
     import numpy as np
 
     if not (xp.is_gpu(data) and data.dtype == np.float64 and data.flags.c_contiguous):
+        return None
+    if data.size > 2**26:
         return None
     plans = space.__dict__.setdefault('_serial_ghost_plans', {})
     key = tuple(data.shape)
@@ -1636,7 +1641,12 @@ class StencilMatrix(LinearOperator):
                 self._synchronizer.end_update_ghost_regions( self._data , self._requests)
         else:
             # SERIAL CASE: fill in ghost regions along periodic directions, otherwise set to zero
-            self._update_ghost_regions_serial()
+            # (on the GPU with one kernel, see _serial_ghost_plan)
+            plan = _serial_ghost_plan(self._codomain, self._data)
+            if plan is None:
+                self._update_ghost_regions_serial()
+            else:
+                plan(self._data)
 
         # Flag ghost regions as up-to-date
         self._sync = True

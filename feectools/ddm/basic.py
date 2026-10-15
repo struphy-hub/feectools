@@ -84,6 +84,10 @@ class _DeviceRegionExchange:
             index = np.concatenate(parts) if parts else np.zeros(0, dtype=np.int64)
             return xp.asarray(index), slices, local_slice
 
+        # host index lists, kept for _FusedDeviceExchange (exchanges of several arrays in one)
+        self.comm = comm
+        self.host_regions = (sends, recvs, local_send, local_recv)
+
         self._send_index, send_slices, self._local_send = layout(sends, local_send)
         self._recv_index, recv_slices, self._local_recv = layout(recvs, local_recv)
         self._send_buf = xp.empty(self._send_index.size, dtype=dtype)
@@ -141,6 +145,126 @@ class _DeviceRegionExchange:
 
     def __call__(self, array):
         self.finish(array, self.start(array))
+
+
+#===============================================================================
+_FUSED_SRC = r"""
+extern "C" __global__ void fused_gather(double* __restrict__ out, const unsigned long long* __restrict__ ptrs,
+                                        const int* __restrict__ comp, const long long* __restrict__ idx, long long n)
+{
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = ((const double*)ptrs[comp[i]])[idx[i]];
+}
+
+extern "C" __global__ void fused_scatter(const double* __restrict__ in, const unsigned long long* __restrict__ ptrs,
+                                         const int* __restrict__ comp, const long long* __restrict__ idx, long long n)
+{
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) ((double*)ptrs[comp[i]])[idx[i]] = in[i];
+}
+"""
+
+
+class _FusedDeviceExchange:
+    """
+    The exchanges of several device arrays (e.g. the components of a block vector) as one.
+
+    Built from one :class:`_DeviceRegionExchange` per array, on the same communicator: the
+    regions that go to the same rank, from every array, travel as one message, gathered by one
+    kernel (and scattered by one) that reads the arrays through a table of their pointers. A
+    block vector of three components thus sends one message per neighbour instead of three, with
+    one gather, one synchronization and one scatter. The arrays must be C-contiguous float64.
+
+    Parameters
+    ----------
+    plans : list of _DeviceRegionExchange
+        One exchange per array, in the order of the arrays passed to :meth:`start`.
+    """
+    TAG = 4243
+
+    def __init__(self, plans):
+        import cupy as cp
+
+        self._comm = plans[0].comm
+
+        def merge(which):
+            """(comp, index) of every region, grouped by rank (sorted), then the local regions; and the slices."""
+            groups = {}
+            local = []
+            for c, plan in enumerate(plans):
+                regions = plan.host_regions
+                for rank, parts in regions[which].items():
+                    groups.setdefault(rank, []).extend((c, p) for p in parts)
+                local.extend((c, p) for p in regions[2 + which])
+            comps, idx, slices, offset = [], [], [], 0
+            for rank in sorted(groups):
+                n = sum(p.size for _, p in groups[rank])
+                for c, p in groups[rank]:
+                    comps.append(np.full(p.size, c, dtype=np.int32))
+                    idx.append(p)
+                slices.append((rank, slice(offset, offset + n)))
+                offset += n
+            local_slice = slice(offset, offset + sum(p.size for _, p in local))
+            for c, p in local:
+                comps.append(np.full(p.size, c, dtype=np.int32))
+                idx.append(p)
+            comp = np.concatenate(comps) if comps else np.zeros(0, dtype=np.int32)
+            index = np.concatenate(idx) if idx else np.zeros(0, dtype=np.int64)
+            return cp.asarray(comp), cp.asarray(index.astype(np.int64)), slices, local_slice
+
+        self._send_comp, self._send_index, send_slices, self._local_send = merge(0)
+        self._recv_comp, self._recv_index, recv_slices, self._local_recv = merge(1)
+        self._send_buf = cp.empty(self._send_index.size, dtype=np.float64)
+        self._recv_buf = cp.empty(self._recv_index.size, dtype=np.float64)
+        self._sends = [(self._send_buf[sl], rank) for rank, sl in send_slices]
+        self._recvs = [(self._recv_buf[sl], rank) for rank, sl in recv_slices]
+        module = cp.RawModule(code=_FUSED_SRC)
+        self._gather = module.get_function("fused_gather")
+        self._scatter = module.get_function("fused_scatter")
+        self._ptr_key = None
+        self._ptrs = None
+
+    def _pointers(self, arrays):
+        import cupy as cp
+
+        key = tuple(int(a.data.ptr) for a in arrays)
+        if key != self._ptr_key:
+            self._ptrs = cp.asarray(np.array(key, dtype=np.uint64))
+            self._ptr_key = key
+        return self._ptrs
+
+    @staticmethod
+    def _launch(kernel, buf, ptrs, comp, idx):
+        n = idx.size
+        if n:
+            kernel(((n + 255) // 256,), (256,), (buf, ptrs, comp, idx, np.int64(n)))
+
+    def start(self, arrays):
+        """Gather the regions of all arrays and post one message per rank; returns the requests."""
+        ptrs = self._pointers(arrays)
+        self._launch(self._gather, self._send_buf, ptrs, self._send_comp, self._send_index)
+        if not (self._sends or self._recvs):
+            return []
+        if get_mpi_cuda_aware() is False:
+            exchange(
+                self._comm,
+                sends=[(buf, rank, self.TAG) for buf, rank in self._sends],
+                receives=[(buf, rank, self.TAG) for buf, rank in self._recvs],
+                cuda_aware=False,
+            )
+            return []
+        synchronize_for_mpi(self._send_buf)
+        requests = [self._comm.Irecv(buf, source=rank, tag=self.TAG) for buf, rank in self._recvs]
+        requests += [self._comm.Isend(buf, dest=rank, tag=self.TAG) for buf, rank in self._sends]
+        return requests
+
+    def finish(self, arrays, requests):
+        """Wait for the messages of :meth:`start` and scatter everything received (and the local copies)."""
+        if requests:
+            MPI.Request.Waitall(requests)
+        if self._local_recv.stop > self._local_recv.start:
+            self._recv_buf[self._local_recv] = self._send_buf[self._local_send]
+        self._launch(self._scatter, self._recv_buf, self._pointers(arrays), self._recv_comp, self._recv_index)
 
 
 #===============================================================================

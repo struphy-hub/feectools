@@ -3,6 +3,7 @@
 # Copyright 2018 Jalal Lakhlili, Yaman Güçlü
 
 import cunumpy as xp
+import numpy as np
 
 from types import MappingProxyType
 from scipy.sparse import bmat, lil_matrix
@@ -412,7 +413,14 @@ class BlockVector(Vector):
 
         req = self.start_update_interface_ghost_regions()
 
-        if all(hasattr(vi, '_start_update_ghost_regions') and xp.is_gpu(vi._data) for vi in self.blocks):
+        fused = self._fused_device_exchange()
+        if fused is not None:
+            # device data on one communicator: one message per neighbour for all blocks (see _fused_device_exchange)
+            arrays = [vi._data for vi in self.blocks]
+            fused.finish(arrays, fused.start(arrays))
+            for vi in self.blocks:
+                vi._sync = True
+        elif all(hasattr(vi, '_start_update_ghost_regions') and xp.is_gpu(vi._data) for vi in self.blocks):
             # device data: the exchanges of all blocks are in flight together, with one wait each at the
             # end, instead of one complete exchange (and its fixed costs) after the other
             for vi in self.blocks:
@@ -427,6 +435,41 @@ class BlockVector(Vector):
 
         # Flag ghost regions as up-to-date
         self._sync = True
+
+    def _fused_device_exchange(self):
+        """The ghost update of all blocks as one exchange, or None if it does not apply.
+
+        For blocks that are parallel StencilVectors with C-contiguous float64 device data on the same communicator and
+        without interfaces, the ghost regions of all blocks that go to the same rank travel as one message, with one
+        gather and one scatter kernel for all blocks (:class:`~feectools.ddm.basic._FusedDeviceExchange`), instead
+        of one message per block and neighbour. Built on first use and cached on the space (by the shapes).
+        """
+        from feectools.linalg.stencil import StencilVector
+
+        blocks = self.blocks
+        if not blocks or not all(isinstance(vi, StencilVector) for vi in blocks):
+            return None
+        V0 = blocks[0].space
+        if not all(
+            vi.space.parallel
+            and not vi.space.cart.is_comm_null
+            and not vi.space.interfaces
+            and xp.is_gpu(vi._data)
+            and vi._data.dtype == np.float64
+            and vi._data.flags.c_contiguous
+            and vi.space.cart.comm_cart is V0.cart.comm_cart
+            for vi in blocks
+        ):
+            return None
+
+        cache = self.space.__dict__.setdefault('_fused_device_exchanges', {})
+        key = tuple(vi._data.shape for vi in blocks)
+        if key not in cache:
+            from feectools.ddm.basic import _FusedDeviceExchange
+
+            plans = [vi.space._synchronizer._device_ghost_plan(vi._data) for vi in blocks]
+            cache[key] = _FusedDeviceExchange(plans) if all(p is not None for p in plans) else None
+        return cache[key]
 
     def start_update_interface_ghost_regions(self):
         self._collect_interface_buf()
