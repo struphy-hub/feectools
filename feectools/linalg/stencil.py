@@ -39,6 +39,7 @@ from feectools.linalg.kernels.stencil_inner_3d     import stencil_inner_3d
 from feectools.linalg.kernels.stencil_dot_1d       import stencil_dot_1d
 from feectools.linalg.kernels.stencil_dot_2d       import stencil_dot_2d
 from feectools.linalg.kernels.stencil_dot_3d       import stencil_dot_3d
+from feectools.utilities.cached_launch import CachedLaunch
 from feectools.linalg.kernels.stencil_transpose_1d import stencil_transpose_1d
 from feectools.linalg.kernels.stencil_transpose_2d import stencil_transpose_2d
 from feectools.linalg.kernels.stencil_transpose_3d import stencil_transpose_3d
@@ -210,14 +211,14 @@ class StencilVectorSpace(VectorSpace):
 
         # Select kernel for AXPY operation
         if self._ndim in [1, 2, 3]:
-            self._axpy_func = stencil_kernels['axpy'][self._ndim]
+            self._axpy_func = CachedLaunch(stencil_kernels['axpy'][self._ndim])
         else:
             self._axpy_func = self._axpy_python
             self._axpy_work = self.zeros()  # work array
 
         # Select kernel for inner product
         if self._ndim in [1, 2, 3]:
-            self._inner_func = stencil_kernels['inner'][self._ndim]
+            self._inner_func = CachedLaunch(stencil_kernels['inner'][self._ndim])
         else:
             self._inner_func = self._inner_python
 
