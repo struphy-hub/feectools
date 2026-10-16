@@ -2182,6 +2182,12 @@ class StencilMatrix(LinearOperator):
 
             # matvec kernel: stencil_dot_<n>d, pyccel or CUDA by backend
             self._func = stencil_kernels['dot'][self._ndim]
+            if self._ndim == 3 and _fake_cupy_active():
+                # the CUDA kernel uses warp shuffles, which the CPU emulation of launches on the fake CuPy
+                # (cunumpy.kernel_testing) cannot run: the same product with one thread per entry
+                from feectools.linalg.kernels.stencil_dot_3d import stencil_dot_3d_fake_cupy
+
+                self._func = stencil_dot_3d_fake_cupy
 
             # parameter for rectangular matrices
             add = [int(end_in >= end_out) for end_in, end_out in zip(self.domain.ends, self.codomain.ends)]
