@@ -17,7 +17,6 @@ from scipy.sparse import coo_matrix, diags as sp_diags
 
 from maybempi import MPI
 from feectools.linalg.basic  import VectorSpace, Vector, LinearOperator
-from feectools.utilities.cached_launch import CachedLaunch
 from feectools.linalg.memory import stencil_matrix_memory
 from feectools.ddm.cart      import find_mpi_type, CartDecomposition, InterfaceCartDecomposition
 from feectools.ddm.utilities import get_data_exchanger
@@ -211,14 +210,14 @@ class StencilVectorSpace(VectorSpace):
 
         # Select kernel for AXPY operation
         if self._ndim in [1, 2, 3]:
-            self._axpy_func = CachedLaunch(stencil_kernels['axpy'][self._ndim])
+            self._axpy_func = stencil_kernels['axpy'][self._ndim]
         else:
             self._axpy_func = self._axpy_python
             self._axpy_work = self.zeros()  # work array
 
         # Select kernel for inner product
         if self._ndim in [1, 2, 3]:
-            self._inner_func = CachedLaunch(stencil_kernels['inner'][self._ndim])
+            self._inner_func = stencil_kernels['inner'][self._ndim]
         else:
             self._inner_func = self._inner_python
 
