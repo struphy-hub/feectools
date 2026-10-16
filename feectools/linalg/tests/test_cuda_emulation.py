@@ -20,8 +20,20 @@ def arrays(args):
     return [a.copy() for a in args if isinstance(a, np.ndarray)]
 
 
+# kernels that serial emulation cannot run (warp shuffles); the GPU parity test (test_cuda_parity) covers them
+GPU_ONLY = {"stencil_dot_3d": "warp shuffles"}
+
+
 @requires_compiler
-@pytest.mark.parametrize("name", list(PARITY_CASES))
+@pytest.mark.parametrize(
+    "name",
+    [
+        pytest.param(name, marks=pytest.mark.skip(reason=f"uses {GPU_ONLY[name]}, which emulation cannot run"))
+        if name in GPU_ONLY
+        else name
+        for name in PARITY_CASES
+    ],
+)
 def test_emulated_parity(name):
     kernel, spec = CUDA_KERNELS[name], PARITY_CASES[name]
     with xp.use_backend("numpy"):
@@ -36,3 +48,21 @@ def test_emulated_parity(name):
             assert any(not np.array_equal(a, b) for a, b in zip(before, host)), f"{name}{case}: the kernel changed nothing"
             for h, e in zip(host, emulated):
                 np.testing.assert_allclose(e, h, rtol=spec.rtol, atol=spec.atol, err_msg=f"{name}{case}")
+
+
+@requires_compiler
+def test_emulated_stencil_dot_3d_rows():
+    """The one-thread-per-entry stencil_dot_3d (used on the fake CuPy instead of the warp-shuffle kernel) against
+    the pyccel kernel, on the parity cases of stencil_dot_3d."""
+    from feectools.linalg.kernels.stencil_dot_3d import stencil_dot_3d_rows
+
+    kernel, spec = CUDA_KERNELS["stencil_dot_3d"], PARITY_CASES["stencil_dot_3d"]
+    rows = stencil_dot_3d_rows()
+    with xp.use_backend("numpy"):
+        for case in spec.cases:
+            host_args = spec.build(case)
+            emulated_args = spec.build(case)
+            kernel(*host_args)
+            emulate_cuda_kernel(rows, *emulated_args, n_threads=rows.n_threads_from(emulated_args))
+            for h, e in zip(arrays(host_args), arrays(emulated_args)):
+                np.testing.assert_allclose(e, h, rtol=spec.rtol, atol=spec.atol, err_msg=f"stencil_dot_3d_rows{case}")

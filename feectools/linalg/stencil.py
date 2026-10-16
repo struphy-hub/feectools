@@ -39,6 +39,7 @@ from feectools.linalg.kernels.stencil_inner_3d     import stencil_inner_3d
 from feectools.linalg.kernels.stencil_dot_1d       import stencil_dot_1d
 from feectools.linalg.kernels.stencil_dot_2d       import stencil_dot_2d
 from feectools.linalg.kernels.stencil_dot_3d       import stencil_dot_3d
+from feectools.utilities.cached_launch import CachedLaunch
 from feectools.linalg.kernels.stencil_transpose_1d import stencil_transpose_1d
 from feectools.linalg.kernels.stencil_transpose_2d import stencil_transpose_2d
 from feectools.linalg.kernels.stencil_transpose_3d import stencil_transpose_3d
@@ -210,14 +211,14 @@ class StencilVectorSpace(VectorSpace):
 
         # Select kernel for AXPY operation
         if self._ndim in [1, 2, 3]:
-            self._axpy_func = stencil_kernels['axpy'][self._ndim]
+            self._axpy_func = CachedLaunch(stencil_kernels['axpy'][self._ndim])
         else:
             self._axpy_func = self._axpy_python
             self._axpy_work = self.zeros()  # work array
 
         # Select kernel for inner product
         if self._ndim in [1, 2, 3]:
-            self._inner_func = stencil_kernels['inner'][self._ndim]
+            self._inner_func = CachedLaunch(stencil_kernels['inner'][self._ndim])
         else:
             self._inner_func = self._inner_python
 
@@ -322,11 +323,19 @@ class StencilVectorSpace(VectorSpace):
             self._inner_func(x._data, y._data, *self._inner_consts, res)
 
         if self.parallel:
-            # The send buffer may have just been written on the device; MPI reads it directly.
-            synchronize_for_mpi(x._dot_send_data, x._dot_recv_data)
-            self.cart.global_comm.Allreduce((x._dot_send_data, self.mpi_type),
-                                            (x._dot_recv_data, self.mpi_type),
-                                             op=MPI.SUM )
+            if xp.is_gpu(x._dot_send_data):
+                # One number: an Allreduce of a host copy (~10 us) is much cheaper than the
+                # CUDA-aware Allreduce of the device buffer (~40 us on H100 nodes). The result
+                # goes back into the device buffer, so the inner product is still a device array.
+                send = xp.to_numpy(x._dot_send_data)
+                recv = send.copy()
+                self.cart.global_comm.Allreduce((send, self.mpi_type), (recv, self.mpi_type), op=MPI.SUM)
+                x._dot_recv_data[...] = xp.asarray(recv)
+            else:
+                synchronize_for_mpi(x._dot_send_data, x._dot_recv_data)
+                self.cart.global_comm.Allreduce((x._dot_send_data, self.mpi_type),
+                                                (x._dot_recv_data, self.mpi_type),
+                                                 op=MPI.SUM )
             res = x._dot_recv_data
 
         if xp.is_gpu(res):
@@ -335,6 +344,31 @@ class StencilVectorSpace(VectorSpace):
             return res[0].copy()
         # a NumPy scalar
         return res[0]
+
+    # ...
+    def inner_local(self, x, y):
+        """The contribution of this process to :meth:`inner` (not reduced over the processes).
+
+        A 0-d device array for device data, a NumPy scalar otherwise. Reduce the contributions
+        of several inner products with one Allreduce on :attr:`inner_comm` to save a reduction
+        (and a device synchronization) per inner product, see
+        :func:`feectools.linalg.solvers._inner_products`.
+        """
+        assert isinstance(x, StencilVector)
+        assert isinstance(y, StencilVector)
+        assert x.space is self
+        assert y.space is self
+
+        res = x._dot_send_data
+        res[0] = 0
+        if x._data.shape[0] != 0:
+            self._inner_func(x._data, y._data, *self._inner_consts, res)
+        return res[0].copy() if xp.is_gpu(res) else res[0]
+
+    @property
+    def inner_comm(self):
+        """The communicator :meth:`inner` reduces over (None if not parallel)."""
+        return self.cart.global_comm if self.parallel else None
 
     # ...
     def axpy(self, a, x, y):
@@ -509,6 +543,97 @@ class StencilVectorSpace(VectorSpace):
             space = StencilVectorSpace(cart, self.dtype)
 
             self._interfaces[axis, ext] = space
+
+#========================================================================
+_SERIAL_GHOST_SRC = r"""
+extern "C" __global__ void serial_ghost_update(double* a, const long long* dst, const long long* src, long long n)
+{
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        long long s = src[i];
+        a[dst[i]] = s >= 0 ? a[s] : 0.0;
+    }
+}
+"""
+
+
+class _SerialGhostPlan:
+    """The serial ghost update (:meth:`StencilVector._update_ghost_regions_serial`) of a device array as one kernel.
+
+    The serial update is up to ``2 * ndim`` strided copies and fills, one launch each. Applied once to an array of
+    flat indices, it gives for every ghost entry the entry its final value comes from (or -1 for zero), corners and
+    the order of the directions included; one kernel then does ``a[dst] = a[src]`` (or 0) for all ghost entries.
+    Valid only if no ghost entry is read (the source entries are all owned), which is checked.
+    """
+
+    def __init__(self, dst, src):
+        import cupy as cp
+        import numpy as np
+
+        self._dst = cp.asarray(dst)
+        self._src = cp.asarray(src)
+        self._n = np.int64(dst.size)
+        self._kernel = cp.RawKernel(_SERIAL_GHOST_SRC, "serial_ghost_update")
+        self._block = (256,)
+        self._grid = ((int(self._n) + 255) // 256,)
+
+    def __call__(self, data):
+        if self._n:
+            self._kernel(self._grid, self._block, (data, self._dst, self._src, self._n))
+
+
+def _fake_cupy_active():
+    """Whether the device arrays are cunumpy's fake CuPy (NumPy behind the CuPy API), which cannot run raw kernels."""
+    from cunumpy.kernel_testing import fake_cupy_active
+
+    return fake_cupy_active()
+
+
+def _serial_ghost_plan(space, data):
+    """The :class:`_SerialGhostPlan` of ``space`` for ``data`` (built on first use), or None if it does not apply.
+
+    Only for C-contiguous float64 device arrays; other data use the slice copies. Also used for the data of a
+    :class:`StencilMatrix` (``space`` its codomain: the slices run over the first ``space.ndim`` axes and take the
+    others whole, as in :meth:`StencilMatrix._update_ghost_regions_serial`), up to ``2**26`` entries: the plan is
+    built from an index array of the size of the data.
+    """
+    import numpy as np
+
+    if not (xp.is_gpu(data) and data.dtype == np.float64 and data.flags.c_contiguous):
+        return None
+    if _fake_cupy_active():
+        # cunumpy's fake CuPy (tests without a GPU) has no raw kernels: the slice copies
+        return None
+    if data.size > 2**26:
+        return None
+    plans = space.__dict__.setdefault('_serial_ghost_plans', {})
+    key = tuple(data.shape)
+    if key in plans:
+        return plans[key]
+
+    # run the serial update on the flat indices (-1: set to zero)
+    idx = np.arange(int(np.prod(key)), dtype=np.int64).reshape(key)
+    for direction in range(space.ndim):
+        p = space.pads[direction] * space.shifts[direction]
+        if p == 0:
+            continue
+        front = [slice(None)] * direction
+        back = [slice(None)] * (idx.ndim - direction - 1)
+        if space.periods[direction]:
+            idx[tuple(front + [slice(-p, None)] + back)] = idx[tuple(front + [slice(p, 2*p)] + back)]
+            idx[tuple(front + [slice(None, p)] + back)] = idx[tuple(front + [slice(-2*p, -p)] + back)]
+        else:
+            idx[tuple(front + [slice(None, p)] + back)] = -1
+            idx[tuple(front + [slice(-p, None)] + back)] = -1
+
+    flat = idx.ravel()
+    dst = np.flatnonzero(flat != np.arange(flat.size))
+    src = flat[dst]
+    # every source must be an entry the update does not write, or the kernel would race
+    plan = None if np.isin(src[src >= 0], dst).any() else _SerialGhostPlan(dst, src)
+    plans[key] = plan
+    return plan
+
 
 #========================================================================
 class StencilVector(Vector):
@@ -827,15 +952,30 @@ class StencilVector(Vector):
 
         """
 
+        self._start_update_ghost_regions()
+        self._end_update_ghost_regions()
+
+    # ...
+    def _start_update_ghost_regions(self):
+        """First half of :meth:`update_ghost_regions`: start the exchange with the neighbours (if parallel)."""
+        if self.space.parallel and not self.space.cart.is_comm_null:
+            self.space._synchronizer.start_update_ghost_regions(self._data, self._requests)
+
+    # ...
+    def _end_update_ghost_regions(self):
+        """Second half of :meth:`update_ghost_regions`: finish the exchange, update the interfaces, flag in sync."""
         # Update interior ghost regions
         if self.space.parallel:
             if not self.space.cart.is_comm_null:
                 # PARALLEL CASE: fill in ghost regions with data from neighbors
-                self.space._synchronizer.start_update_ghost_regions(self._data, self._requests)
-                self.space._synchronizer.  end_update_ghost_regions(self._data, self._requests)
+                self.space._synchronizer.end_update_ghost_regions(self._data, self._requests)
         else:
             # SERIAL CASE: fill in ghost regions along periodic directions, otherwise set to zero
-            self._update_ghost_regions_serial()
+            plan = _serial_ghost_plan(self._space, self._data)
+            if plan is None:
+                self._update_ghost_regions_serial()
+            else:
+                plan(self._data)
 
         # Update interface ghost regions
         if self.space.parallel:
@@ -1511,7 +1651,12 @@ class StencilMatrix(LinearOperator):
                 self._synchronizer.end_update_ghost_regions( self._data , self._requests)
         else:
             # SERIAL CASE: fill in ghost regions along periodic directions, otherwise set to zero
-            self._update_ghost_regions_serial()
+            # (on the GPU with one kernel, see _serial_ghost_plan)
+            plan = _serial_ghost_plan(self._codomain, self._data)
+            if plan is None:
+                self._update_ghost_regions_serial()
+            else:
+                plan(self._data)
 
         # Flag ghost regions as up-to-date
         self._sync = True
@@ -2038,6 +2183,12 @@ class StencilMatrix(LinearOperator):
 
             # matvec kernel: stencil_dot_<n>d, pyccel or CUDA by backend
             self._func = stencil_kernels['dot'][self._ndim]
+            if self._ndim == 3 and _fake_cupy_active():
+                # the CUDA kernel uses warp shuffles, which the CPU emulation of launches on the fake CuPy
+                # (cunumpy.kernel_testing) cannot run: the same product with one thread per entry
+                from feectools.linalg.kernels.stencil_dot_3d import stencil_dot_3d_fake_cupy
+
+                self._func = stencil_dot_3d_fake_cupy
 
             # parameter for rectangular matrices
             add = [int(end_in >= end_out) for end_in, end_out in zip(self.domain.ends, self.codomain.ends)]

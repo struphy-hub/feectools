@@ -42,6 +42,7 @@ class BlockingCartDataExchanger(CartDataExchanger):
         self._cart = cart
         self._comm = cart.comm_cart
         self._axis = axis
+        self._shape = shape
 
         if assembly:
             self._assembly_send_types, self._assembly_recv_types = self._create_assembly_buffer_types(
@@ -81,6 +82,12 @@ class BlockingCartDataExchanger(CartDataExchanger):
     def start_update_ghost_regions( self, array, requests ):
 
         assert isinstance( array, xp.ndarray )
+
+        if xp.is_gpu( array ):
+            # contiguous device buffers instead of subarray datatypes (see CartDataExchanger)
+            for direction in range( self._cart.ndim ):
+                self._device_update_ghost_regions_along( array, direction )
+            return
 
         # MPI reads/writes `array` directly; on a device backend the
         # kernels that produced it must have finished first.
@@ -126,6 +133,11 @@ class BlockingCartDataExchanger(CartDataExchanger):
     def start_exchange_assembly_data( self, array ):
 
         assert isinstance( array, xp.ndarray )
+
+        if xp.is_gpu( array ):
+            # contiguous device buffers instead of subarray datatypes (see CartDataExchanger)
+            self._device_exchange_assembly_data( array )
+            return
 
         # MPI reads/writes `array` directly; on a device backend the
         # kernels that produced it must have finished first.

@@ -3,6 +3,7 @@
 # Copyright 2018 Jalal Lakhlili, Yaman Güçlü
 
 import cunumpy as xp
+import numpy as np
 
 from types import MappingProxyType
 from scipy.sparse import bmat, lil_matrix
@@ -125,6 +126,19 @@ class BlockVectorSpace(VectorSpace):
         assert x.space is self
         assert y.space is self
         return sum(Vi.inner(xi, yi) for Vi, xi, yi in zip(self.spaces, x.blocks, y.blocks))
+
+    def inner_local(self, x, y):
+        """The contribution of this process to :meth:`inner` (sum of the blocks', not reduced)."""
+        assert isinstance(x, BlockVector)
+        assert isinstance(y, BlockVector)
+        assert x.space is self
+        assert y.space is self
+        return sum(Vi.inner_local(xi, yi) for Vi, xi, yi in zip(self.spaces, x.blocks, y.blocks))
+
+    @property
+    def inner_comm(self):
+        """The communicator :meth:`inner` reduces over: that of the blocks (None if not parallel)."""
+        return self.spaces[0].inner_comm
 
     #...
     def axpy(self, a, x, y):
@@ -399,13 +413,67 @@ class BlockVector(Vector):
 
         req = self.start_update_interface_ghost_regions()
 
-        for vi in self.blocks:
-            vi.update_ghost_regions()
+        fused = self._fused_device_exchange()
+        if fused is not None:
+            # device data on one communicator: one message per neighbour for all blocks (see _fused_device_exchange)
+            arrays = [vi._data for vi in self.blocks]
+            fused.finish(arrays, fused.start(arrays))
+            for vi in self.blocks:
+                vi._sync = True
+        elif all(hasattr(vi, '_start_update_ghost_regions') and xp.is_gpu(vi._data) for vi in self.blocks):
+            # device data: the exchanges of all blocks are in flight together, with one wait each at the
+            # end, instead of one complete exchange (and its fixed costs) after the other
+            for vi in self.blocks:
+                vi._start_update_ghost_regions()
+            for vi in self.blocks:
+                vi._end_update_ghost_regions()
+        else:
+            for vi in self.blocks:
+                vi.update_ghost_regions()
 
         self.end_update_interface_ghost_regions(req)
 
         # Flag ghost regions as up-to-date
         self._sync = True
+
+    def _fused_device_exchange(self):
+        """The ghost update of all blocks as one exchange, or None if it does not apply.
+
+        For blocks that are parallel StencilVectors with C-contiguous float64 device data on the same communicator and
+        without interfaces, the ghost regions of all blocks that go to the same rank travel as one message, with one
+        gather and one scatter kernel for all blocks (:class:`~feectools.ddm.basic._FusedDeviceExchange`), instead
+        of one message per block and neighbour. Built on first use and cached on the space (by the shapes).
+        """
+        from feectools.linalg.stencil import StencilVector
+
+        blocks = self.blocks
+        if not blocks or not all(isinstance(vi, StencilVector) for vi in blocks):
+            return None
+        V0 = blocks[0].space
+        from feectools.linalg.stencil import _fake_cupy_active
+        if _fake_cupy_active():
+            # cunumpy's fake CuPy (tests without a GPU) cannot run the gather and scatter kernels
+            return None
+        if not all(
+            vi.space.parallel
+            and not vi.space.cart.is_comm_null
+            and not vi.space.interfaces
+            and xp.is_gpu(vi._data)
+            and vi._data.dtype == np.float64
+            and vi._data.flags.c_contiguous
+            and vi.space.cart.comm_cart is V0.cart.comm_cart
+            for vi in blocks
+        ):
+            return None
+
+        cache = self.space.__dict__.setdefault('_fused_device_exchanges', {})
+        key = tuple(vi._data.shape for vi in blocks)
+        if key not in cache:
+            from feectools.ddm.basic import _FusedDeviceExchange
+
+            plans = [vi.space._synchronizer._device_ghost_plan(vi._data) for vi in blocks]
+            cache[key] = _FusedDeviceExchange(plans) if all(p is not None for p in plans) else None
+        return cache[key]
 
     def start_update_interface_ghost_regions(self):
         self._collect_interface_buf()
@@ -682,7 +750,9 @@ class BlockLinearOperator(LinearOperator):
                 assert isinstance(out, BlockVector)
 
             assert out.space is self.codomain
-            out *= 0.0
+            # `_dot` writes every block row of `out` itself (see there); other kernels add to it
+            if self._func is not self._dot:
+                out *= 0.0
         else:
             out = self.codomain.zeros()
 
@@ -697,16 +767,33 @@ class BlockLinearOperator(LinearOperator):
     #...
     @staticmethod
     def _dot(blocks, v, out, n_rows, n_cols, inc):
+        # The first block of each block row writes its product straight into that row of `out`; further blocks of
+        # the row go through `inc` and are added. A row with a single block (e.g. the diagonal blocks of a mass
+        # matrix on a Cuboid, the gradient) thus costs no zeroing pass and no addition; rows without any block are
+        # set to zero.
 
         if n_rows == 1:
+            written = False
             for (_, j), L0j in blocks.items():
-                out += L0j.dot(v[j], out=inc)
-        elif n_cols == 1:
-            for (i, _), Li0 in blocks.items():
-                out[i] += Li0.dot(v, out=inc[i])
+                if written:
+                    out += L0j.dot(v[j], out=inc)
+                else:
+                    L0j.dot(v[j], out=out)
+                    written = True
+            if not written:
+                out *= 0.0
         else:
+            written = set()
             for (i, j), Lij in blocks.items():
-                out[i] += Lij.dot(v[j], out=inc[i])
+                vj = v if n_cols == 1 else v[j]
+                if i in written:
+                    out[i] += Lij.dot(vj, out=inc[i])
+                else:
+                    Lij.dot(vj, out=out[i])
+                    written.add(i)
+            for i in range(n_rows):
+                if i not in written:
+                    out[i] *= 0.0
 
     # ...
     def transpose(self, conjugate=False, out=None):

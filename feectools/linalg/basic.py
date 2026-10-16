@@ -820,8 +820,9 @@ class IdentityOperator(LinearOperator):
         if out is not None:
             assert isinstance(out, Vector)
             assert out.space == self.codomain
-            out *= 0
-            out += v
+            if out is not v:
+                # one copy (instead of out *= 0; out += v, which also kept NaNs of the old out)
+                v.copy(out=out)
             return out
         else:
             return v.copy()

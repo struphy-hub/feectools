@@ -12,6 +12,9 @@ build
 *egg*
 *dist*
 *cache*
+# source files with 'cache' in their name (the rule above would ignore them)
+!feectools/utilities/cached_launch.py
+!feectools/linalg/tests/test_cached_launch.py
 prof
 
 *.swp
