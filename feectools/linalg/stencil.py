@@ -581,6 +581,13 @@ class _SerialGhostPlan:
             self._kernel(self._grid, self._block, (data, self._dst, self._src, self._n))
 
 
+def _fake_cupy_active():
+    """Whether the device arrays are cunumpy's fake CuPy (NumPy behind the CuPy API), which cannot run raw kernels."""
+    from cunumpy.kernel_testing import fake_cupy_active
+
+    return fake_cupy_active()
+
+
 def _serial_ghost_plan(space, data):
     """The :class:`_SerialGhostPlan` of ``space`` for ``data`` (built on first use), or None if it does not apply.
 
@@ -592,6 +599,9 @@ def _serial_ghost_plan(space, data):
     import numpy as np
 
     if not (xp.is_gpu(data) and data.dtype == np.float64 and data.flags.c_contiguous):
+        return None
+    if _fake_cupy_active():
+        # cunumpy's fake CuPy (tests without a GPU) has no raw kernels: the slice copies
         return None
     if data.size > 2**26:
         return None

@@ -438,7 +438,9 @@ class PConjugateGradient(InverseLinearOperator):
                 break
 
             v  = A.dot(p, out=v)
-            l  = am / _inner_products((v, p))[0]
+            # v.p as a device scalar (no copy to the host: axpy takes it on the device); the host copy of the
+            # iteration is the one of r.r and s.r below
+            l  = am / v.inner(p)
 
             x.mul_iadd(l, p) # this is x += l*p
             r.mul_iadd(-l, v) # this is r -= l*v

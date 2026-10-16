@@ -450,6 +450,10 @@ class BlockVector(Vector):
         if not blocks or not all(isinstance(vi, StencilVector) for vi in blocks):
             return None
         V0 = blocks[0].space
+        from feectools.linalg.stencil import _fake_cupy_active
+        if _fake_cupy_active():
+            # cunumpy's fake CuPy (tests without a GPU) cannot run the gather and scatter kernels
+            return None
         if not all(
             vi.space.parallel
             and not vi.space.cart.is_comm_null

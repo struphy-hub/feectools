@@ -20,8 +20,20 @@ def arrays(args):
     return [a.copy() for a in args if isinstance(a, np.ndarray)]
 
 
+# kernels that serial emulation cannot run (warp shuffles); the GPU parity test (test_cuda_parity) covers them
+GPU_ONLY = {"stencil_dot_3d": "warp shuffles"}
+
+
 @requires_compiler
-@pytest.mark.parametrize("name", list(PARITY_CASES))
+@pytest.mark.parametrize(
+    "name",
+    [
+        pytest.param(name, marks=pytest.mark.skip(reason=f"uses {GPU_ONLY[name]}, which emulation cannot run"))
+        if name in GPU_ONLY
+        else name
+        for name in PARITY_CASES
+    ],
+)
 def test_emulated_parity(name):
     kernel, spec = CUDA_KERNELS[name], PARITY_CASES[name]
     with xp.use_backend("numpy"):
