@@ -322,7 +322,7 @@ class StencilVectorSpace(VectorSpace):
         if x._data.shape[0] != 0:
             self._inner_func(x._data, y._data, *self._inner_consts, res)
 
-        if self.parallel:
+        if self.parallel and self.cart.global_comm.Get_size() > 1:
             if xp.is_gpu(x._dot_send_data):
                 # One number: an Allreduce of a host copy (~10 us) is much cheaper than the
                 # CUDA-aware Allreduce of the device buffer (~40 us on H100 nodes). The result
