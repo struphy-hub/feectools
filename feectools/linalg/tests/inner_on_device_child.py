@@ -76,7 +76,7 @@ def problem():
 
 
 def solver_kwargs(name, A):
-    return {"pc": A.diagonal(inverse=True)} if name in ("pcg", "pbicgstab") else {}
+    return {"pc": A.diagonal(inverse=True)} if name in ("pcg", "pcg_sr", "pbicgstab") else {}
 
 
 def host(a):

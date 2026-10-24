@@ -4,6 +4,7 @@ This module provides iterative solvers and preconditioners.
 
 """
 import cunumpy as xp
+import numpy as np
 from math import sqrt, inf
 
 from feectools.utilities.utils  import is_real
@@ -17,6 +18,7 @@ __all__ = (
     'inverse',
     'ConjugateGradient',
     'PConjugateGradient',
+    'PConjugateGradientSingleReduction',
     'BiConjugateGradient',
     'BiConjugateGradientStabilized',
     'PBiConjugateGradientStabilized',
@@ -42,6 +44,39 @@ def _host(s):
     return xp.to_numpy(s)[()] if xp.is_gpu(s) else s
 
 
+def _inner_products(*pairs):
+    """The inner products ``x.inner(y)`` of the ``(x, y)`` pairs, with one reduction.
+
+    Each inner product of distributed vectors is otherwise one Allreduce (one per block for block
+    vectors) and, with device data, one synchronization and copy to the host. Here the local
+    contributions (``space.inner_local``) are collected, copied to the host together (one
+    synchronization) and reduced with a single Allreduce on the spaces' communicator (if any).
+    The results are host scalars, also for device data: the solver's vector updates (axpy) take
+    their coefficient by value, so a device scalar would be copied to the host at every update.
+    Vectors whose spaces do not provide ``inner_local`` / ``inner_comm`` (or whose blocks do not
+    share one communicator) use ``x.inner(y)`` as before.
+    """
+    try:
+        comms = {id(x.space.inner_comm) for x, _ in pairs}
+        if isinstance(pairs[0][0].space, BlockVectorSpace):
+            comms |= {id(Vi.inner_comm) for x, _ in pairs for Vi in x.space.spaces}
+        comm = pairs[0][0].space.inner_comm
+        local = [x.space.inner_local(x, y) for x, y in pairs]
+    except AttributeError:
+        return [_host(x.inner(y)) for x, y in pairs]
+    if len(comms) != 1:
+        return [_host(x.inner(y)) for x, y in pairs]
+
+    if any(xp.is_gpu(v) for v in local):
+        values = xp.to_numpy(xp.stack([xp.asarray(v) for v in local]))  # one copy to the host
+    else:
+        values = np.array(local)
+    if comm is not None and comm.Get_size() > 1:
+        from maybempi import MPI
+        comm.Allreduce(MPI.IN_PLACE, values, op=MPI.SUM)
+    return [values[i] for i in range(len(pairs))]
+
+
 def _sqrt(s):
     """Square root that keeps a device scalar on the device; `math.sqrt` for host scalars."""
     return xp.sqrt(s) if xp.is_gpu(s) else sqrt(s)
@@ -65,7 +100,7 @@ def inverse(A, solver, **kwargs):
         function (e.g. a matrix-vector product A*p).
 
     solver : str
-        Preferred iterative solver. Options are: 'cg', 'pcg', 'bicg',
+        Preferred iterative solver. Options are: 'cg', 'pcg', 'pcg_sr', 'bicg',
         'bicgstab', 'pbicgstab', 'minres', 'lsmr', 'gmres'.
 
     Returns
@@ -81,6 +116,7 @@ def inverse(A, solver, **kwargs):
     solvers_dict = {
         'cg'       : ConjugateGradient,
         'pcg'      : PConjugateGradient,
+        'pcg_sr'   : PConjugateGradientSingleReduction,
         'bicg'     : BiConjugateGradient,
         'bicgstab' : BiConjugateGradientStabilized,
         'pbicgstab': PBiConjugateGradientStabilized,
@@ -374,13 +410,13 @@ class PConjugateGradient(InverseLinearOperator):
         p = self._tmps["p"]
         s = self._tmps["s"]
 
-        # First values
+        # First values (r.r and s.r with one reduction, as host scalars)
         A.dot(x, out=v)
         b.copy(out=r)
         r       -= v
-        nrmr_sqr = r.inner(r).real
         pc.dot(r, out=s)
-        am       = s.inner(r)
+        nrmr_sqr, am = _inner_products((r, r), (s, r))
+        nrmr_sqr = nrmr_sqr.real
         s.copy(out=p)
 
         tol_sqr  = tol**2
@@ -402,15 +438,17 @@ class PConjugateGradient(InverseLinearOperator):
                 break
 
             v  = A.dot(p, out=v)
+            # v.p as a device scalar (no copy to the host: axpy takes it on the device); the host copy of the
+            # iteration is the one of r.r and s.r below
             l  = am / v.inner(p)
 
             x.mul_iadd(l, p) # this is x += l*p
             r.mul_iadd(-l, v) # this is r -= l*v
 
-            nrmr_sqr = r.inner(r).real
+            # r.r and s.r with one reduction
             pc.dot(r, out=s)
-
-            am1 = s.inner(r)
+            nrmr_sqr, am1 = _inner_products((r, r), (s, r))
+            nrmr_sqr = nrmr_sqr.real
 
             # we are computing p = (am1 / am) * p + s by using axpy on s and exchanging the arrays
             s.mul_iadd((am1/am), p)
@@ -435,6 +473,141 @@ class PConjugateGradient(InverseLinearOperator):
 
     def dot(self, b, out=None):
         return self.solve(b, out=out)
+
+#===============================================================================
+class PConjugateGradientSingleReduction(PConjugateGradient):
+    """
+    Preconditioned Conjugate Gradient with one reduction per iteration (Chronopoulos-Gear variant).
+
+    Mathematically the same iterates as :class:`PConjugateGradient`, but all inner products of an
+    iteration, ``(r, u)``, ``(w, u)`` and ``(r, r)`` with ``u = P r`` and ``w = A u``, are computed
+    together, so with distributed vectors each iteration has one Allreduce (and with device data one
+    synchronization) instead of two. ``A p`` is then not computed but updated by the recurrence
+    ``s = w + beta * s``, which costs one more vector update and two more work vectors per
+    iteration. Use it when the global reductions dominate, e.g. many MPI ranks or GPUs; the
+    residual can drift from ``b - A x`` at round-off level, which matters only for tolerances near
+    machine precision.
+
+    Same parameters as :class:`PConjugateGradient`; select it with ``inverse(A, 'pcg_sr', ...)``.
+
+    References
+    ----------
+    A. T. Chronopoulos and C. W. Gear, s-step iterative methods for symmetric linear systems,
+    J. Comput. Appl. Math. 25 (1989), 153-168.
+    """
+    def __init__(self, A, *, pc=None, x0=None, tol=1e-6, maxiter=1000, verbose=False, recycle=False):
+
+        super().__init__(A, pc=pc, x0=x0, tol=tol, maxiter=maxiter, verbose=verbose, recycle=recycle)
+
+        self._tmps["u"] = self.codomain.zeros()
+        self._tmps["w"] = self.domain.zeros()
+
+    def solve(self, b, out=None):
+        """
+        Solve the symmetric positive definite system Ax = b, see :meth:`PConjugateGradient.solve`.
+        Info can be accessed using get_info(), see :func:~`basic.InverseLinearOperator.get_info`.
+
+        Parameters
+        ----------
+        b : feectools.linalg.basic.Vector
+            Right-hand-side vector of linear system.
+
+        out : feectools.linalg.basic.Vector | NoneType
+            The output vector, or None (optional).
+
+        Returns
+        -------
+        x : feectools.linalg.basic.Vector
+            Numerical solution of the linear system.
+        """
+
+        A = self._A
+        options = self._options
+        pc = options["pc"]
+        tol = options["tol"]
+        maxiter = options["maxiter"]
+        verbose = options["verbose"]
+
+        assert isinstance(b, Vector)
+        assert b.space is self._domain
+        assert isinstance(pc, LinearOperator)
+        if out is not None:
+            assert isinstance(out, Vector)
+            assert out.space is self._codomain
+
+        x = options["x0"].copy(out=out)
+
+        # p: search direction, s = A p, u = P r, w = A u
+        r = self._tmps["r"]
+        p = self._tmps["p"]
+        s = self._tmps["s"]
+        u = self._tmps["u"]
+        w = self._tmps["w"]
+        v = self._tmps["v"]
+
+        A.dot(x, out=v)
+        b.copy(out=r)
+        r -= v
+        pc.dot(r, out=u)
+        A.dot(u, out=w)
+        nrmr_sqr, gamma, delta = _inner_products((r, r), (u, r), (w, u))
+        nrmr_sqr = nrmr_sqr.real
+
+        tol_sqr = tol**2
+
+        if verbose:
+            print( "Pre-conditioned CG solver (single reduction):" )
+            print( "+---------+---------------------+")
+            print( "+ Iter. # | L2-norm of residual |")
+            print( "+---------+---------------------+")
+            template = "| {:7d} | {:19.2e} |"
+            print( template.format(1, sqrt(nrmr_sqr)))
+
+        beta = 0.0
+        alpha = 0.0
+        for k in range(2, maxiter+1):
+
+            if nrmr_sqr < tol_sqr:
+                k -= 1
+                break
+
+            if k == 2:
+                alpha = gamma / delta
+                u.copy(out=p)
+                w.copy(out=s)
+            else:
+                alpha = gamma / (delta - beta * gamma / alpha)
+                # p = u + beta * p and s = w + beta * s, by axpy on u and w and exchanging the arrays
+                u.mul_iadd(beta, p)
+                u, p = p, u
+                w.mul_iadd(beta, s)
+                w, s = s, w
+
+            x.mul_iadd(alpha, p)
+            r.mul_iadd(-alpha, s)
+
+            pc.dot(r, out=u)
+            A.dot(u, out=w)
+            gamma_old = gamma
+            nrmr_sqr, gamma, delta = _inner_products((r, r), (u, r), (w, u))
+            nrmr_sqr = nrmr_sqr.real
+            beta = gamma / gamma_old
+
+            if verbose:
+                print( template.format(k, sqrt(nrmr_sqr)))
+
+        if verbose:
+            print( "+---------+---------------------+")
+
+        # keep the exchanged arrays for the next solve
+        self._tmps.update(p=p, s=s, u=u, w=w)
+
+        self._info = {'niter': k, 'success': nrmr_sqr < tol_sqr, 'res_norm': sqrt(nrmr_sqr) }
+
+        if options["recycle"]:
+            x.copy(out=options["x0"])
+
+        return x
 
 #===============================================================================
 class BiConjugateGradient(InverseLinearOperator):

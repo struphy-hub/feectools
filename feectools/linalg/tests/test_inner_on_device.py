@@ -24,7 +24,7 @@ from feectools.linalg.solvers import inverse
 from feectools.linalg.stencil import StencilMatrix, StencilVector, StencilVectorSpace
 
 CHILD = Path(__file__).with_name("inner_on_device_child.py")
-DEVICE_SOLVERS = ("cg", "pcg", "bicg", "bicgstab", "pbicgstab")
+DEVICE_SOLVERS = ("cg", "pcg", "pcg_sr", "bicg", "bicgstab", "pbicgstab")
 HOST_SOLVERS = ("minres", "lsmr", "gmres")
 
 
@@ -64,7 +64,7 @@ def test_solver_info_numpy(solver):
     """The convergence information is made of host scalars, as before."""
     with xp.use_backend("numpy"):
         V, A, xe, b = problem()
-        kw = {"pc": A.diagonal(inverse=True)} if solver in ("pcg", "pbicgstab") else {}
+        kw = {"pc": A.diagonal(inverse=True)} if solver in ("pcg", "pcg_sr", "pbicgstab") else {}
         S = inverse(A, solver, tol=1e-12, maxiter=1000, **kw)
         x = S.solve(b)
         info = S.get_info()
@@ -149,7 +149,7 @@ def test_inner_on_gpu():
 def test_one_host_copy_per_iteration_on_gpu(solver):
     with xp.use_backend("cupy"):
         V, A, xe, b = problem()
-        kw = {"pc": A.diagonal(inverse=True)} if solver in ("pcg", "pbicgstab") else {}
+        kw = {"pc": A.diagonal(inverse=True)} if solver in ("pcg", "pcg_sr", "pbicgstab") else {}
         inverse(A, solver, tol=1e-12, maxiter=1000, **kw).solve(b)
         counts = []
         for maxiter in (5, 15):

@@ -43,6 +43,7 @@ class NonBlockingCartDataExchanger(CartDataExchanger):
         self._cart = cart
         self._comm = cart.comm_cart
         self._axis = axis
+        self._shape = shape
 
         if assembly:
             self._assembly_send_types, self._assembly_recv_types = self._create_assembly_buffer_types(
@@ -74,6 +75,11 @@ class NonBlockingCartDataExchanger(CartDataExchanger):
     # ...
     def prepare_communications(self, u):
 
+        # Device arrays need no persistent requests: their ghost regions are exchanged
+        # through contiguous buffers (`_device_ghost_plan`)
+        if xp.is_gpu(u):
+            return ()
+
         # Requests' handles
         requests = []
         cart = self._cart
@@ -99,18 +105,51 @@ class NonBlockingCartDataExchanger(CartDataExchanger):
         return tuple(requests)
 
     def start_update_ghost_regions(self, array, requests ):
+        if xp.is_gpu(array):
+            # started here, finished in end_update_ghost_regions: several vectors (e.g. the
+            # components of a block vector) can exchange at the same time
+            plan = self._device_ghost_plan(array)
+            pending = self.__dict__.setdefault('_device_pending', {})
+            pending[id(array)] = (plan, plan.start(array))
+            return
         # The persistent requests read/write `array` directly; on a device
         # backend the kernels that produced it must have finished first.
         synchronize_for_mpi( array )
         MPI.Prequest.Startall( requests )
 
     def end_update_ghost_regions(self, array, requests):
+        if xp.is_gpu(array):
+            plan, device_requests = self._device_pending.pop(id(array))
+            plan.finish(array, device_requests)
+            return
         MPI.Prequest.Waitall  ( requests )
+
+    # ...
+    def _device_ghost_plan(self, array):
+        """The exchange of all ghost regions (every shift, as the persistent requests) of a device array."""
+        cart = self._cart
+
+        def transfers():
+            out = []
+            for shift in product( [-1,0,1], repeat=cart._ndims ):
+                if all(s==0 for s in shift):
+                    continue
+                info = cart.get_shift_info_non_blocking( shift )
+                out.append((self._region(info['send_starts'], info['buf_shape'], array.shape), info['rank_dest'],
+                            self._region(info['recv_starts'], info['buf_shape'], array.shape), info['rank_source']))
+            return out
+
+        return self._device_plan('ghost', array, cart._comm_cart, transfers)
 
     # ...
     def start_exchange_assembly_data( self, array ):
 
         assert isinstance( array, xp.ndarray )
+
+        if xp.is_gpu( array ):
+            # contiguous device buffers instead of subarray datatypes (see CartDataExchanger)
+            self._device_exchange_assembly_data( array )
+            return
 
         # MPI reads/writes `array` directly; on a device backend the
         # kernels that produced it must have finished first.
